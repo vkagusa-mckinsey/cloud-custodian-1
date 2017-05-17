@@ -86,7 +86,11 @@ class PolicyChecker:
     # Policy statement handling
     def check(self, policy_text):
         if isinstance(policy_text, str):
-            policy = json.loads(policy_text)
+            try:
+                policy = json.loads(policy_text)
+            except ValueError:
+                log.error("Error loading policy from string: %s " % repr(policy_text))
+                return []
         else:
             policy = policy_text
 
