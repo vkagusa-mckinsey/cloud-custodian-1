@@ -4,7 +4,7 @@ import logging
 
 from c7n.actions import Action, BaseAction
 from c7n.exceptions import PolicyValidationError
-from c7n.filters import ValueFilter, Filter, FilterRegistery
+from c7n.filters import ValueFilter, Filter, FilterRegistry, OPERATORS
 from c7n.manager import resources
 from c7n.tags import universal_augment
 from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
@@ -349,3 +349,42 @@ class MonitoredCloudtrailMetric(ValueFilter):
 
     def process(self, resources, event=None):
         return [resource for resource in resources if self.checkResourceMetricFilters(resource)]
+
+@filters.register('in-home-region')
+class InHomeRegionFilter(Filter):
+    """Filters for all cloudtrail trails that are currently in their home region.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: cloudtrail-in-home-region
+                resource: cloudtrail
+                filters:
+                  - type: in-home-region
+                actions:
+                  - delete-global-grants
+    """
+    schema = type_schema('in-home-region')
+
+    def process(self, trails, event=None):
+        session = local_session(self.manager.session_factory)
+        current_region = session.region_name
+        return [t for t in trails if t['HomeRegion'] == current_region]
+
+@CloudTrail.filter_registry.register('trail-status')
+class TrailStatusFilter(ValueFilter):
+    schema = type_schema('trail-status', rinherit=ValueFilter.schema)
+    permissions = ('cloudtrail:GetTrailStatus',)
+
+    def process(self, resources, event=None):
+        client = local_session(self.manager.session_factory).client('cloudtrail')
+        matches = []
+        for item in resources:
+            if 'c7n:TrailStatus' not in item:
+                status = self.manager.retry(client.get_trail_status, Name=item['TrailARN'])
+                item['c7n:TrailStatus'] = status
+            if self.match(item['c7n:TrailStatus']):
+                matches.append(item)
+        return matches

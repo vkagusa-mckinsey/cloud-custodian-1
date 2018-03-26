@@ -8,6 +8,7 @@ import datetime
 import re
 from botocore.exceptions import ClientError
 from fnmatch import fnmatch
+import logging
 from dateutil.parser import parse as parse_date
 from dateutil.tz import tzutc
 
@@ -128,6 +129,8 @@ class CloudTrailEnabled(Filter):
         **{'multi-region': {'type': 'boolean'},
            'global-events': {'type': 'boolean'},
            'current-region': {'type': 'boolean'},
+           'in-home-region': {'type': 'boolean'},
+           'outside-home-region': {'type': 'boolean'},
            'running': {'type': 'boolean'},
            'notifies': {'type': 'boolean'},
            'file-digest': {'type': 'boolean'},
@@ -137,16 +140,25 @@ class CloudTrailEnabled(Filter):
     permissions = ('cloudtrail:DescribeTrails', 'cloudtrail:GetTrailStatus')
 
     def process(self, resources, event=None):
+        account = resources[0]
         session = local_session(self.manager.session_factory)
-        client = session.client('cloudtrail')
-        trails = client.describe_trails()['trailList']
-        resources[0]['c7n:cloudtrails'] = trails
+        if not 'c7n:cloudtrails' in account:
+            client = session.client('cloudtrail')
+            trails = client.describe_trails()['trailList']
+            account['c7n:cloudtrails'] = trails
+        trails = account['c7n:cloudtrails']
         if self.data.get('global-events'):
             trails = [t for t in trails if t.get('IncludeGlobalServiceEvents')]
         if self.data.get('current-region'):
             current_region = session.region_name
             trails = [t for t in trails if t.get(
                 'HomeRegion') == current_region or t.get('IsMultiRegionTrail')]
+        if self.data.get('in-home-region'):
+            current_region = session.region_name
+            trails  = [t for t in trails if t.get('HomeRegion') == current_region]
+        if self.data.get('outside-home-region'):
+            current_region = session.region_name
+            trails  = [t for t in trails if t.get('HomeRegion') != current_region]
         if self.data.get('kms'):
             trails = [t for t in trails if t.get('KmsKeyId')]
         if self.data.get('kms-key'):
@@ -1815,7 +1827,8 @@ class MonitoredCloudtrailMetric(Filter):
     schema = type_schema('alarmed-cloudtrail-patterns', **{
         'patterns': {'type': 'array'},
         'topic-subscription': {'type': 'boolean'},
-        'alarm': {'type': 'boolean'}
+        'alarm': {'type': 'boolean'},
+        'ignore-cross-account-authorization': {'type': 'boolean'}
     })
 
     permissions = ('logs:DescribeMetricFilters', 'cloudwatch:DescribeAlarms',
@@ -1824,17 +1837,25 @@ class MonitoredCloudtrailMetric(Filter):
     def find_subscribed_topic_arns(self, session, topicArns, region):
         sns = session.client('sns', region_name=region)
         def arn_has_subscriptions(arn):
-            subscriptions = sns.list_subscriptions_by_topic(TopicArn=arn)['Subscriptions']
-            return any(subscriptions)
-        return filter(arn_has_subscriptions, topicArns)
+            self.log.info("Checking subscriptions for %s" % arn)
+            try:
+                subscriptions = sns.list_subscriptions_by_topic(TopicArn=arn)['Subscriptions']
+                return any(subscriptions)
+            except sns.exceptions.NotFoundException:
+                self.log.info("ARN %s was not found in list_subscriptions_by_topic" % arn)
+                return False
+
+        return list(filter(arn_has_subscriptions, topicArns))
 
     def all_alarms(self, session, region):
         client = session.client('cloudwatch', region_name=region)
         paginator = client.get_paginator('describe_alarms')
         try:
+            self.log.info("Listing all alarms in region %s" % region)
             results = paginator.paginate().build_full_result()
             return results['MetricAlarms']
         except ClientError as e:
+            self.log.info("Error getting list of all alarms: %s" % e.response['Error']['Code'])
             if e.response['Error']['Code'] == 'ResourceNotFoundException':
                 return []
             else:
@@ -1853,41 +1874,52 @@ class MonitoredCloudtrailMetric(Filter):
                 raise
 
     def alarm_contains_metrics(self, alarm, metrics):
+        if 'Namespace' not in alarm or 'MetricName' not in alarm:
+            self.log.info("No namespace / metric associated with alarm")
+            return False
         pair = (alarm['Namespace'], alarm['MetricName'])
         return pair in metrics
 
     def account_matches_filters(self, account):
         trails = self.manager.get_resource_manager('cloudtrail').resources()
-        return any(filter(self.cloudtrail_matches_filter, trails))
+        self.log.info("Checkin account again %d trails" % len(trails))
+        return any(list(filter(self.cloudtrail_matches_filter, trails)))
 
     def text_matches_patterns(self, metric_filter):
         patterns = self.data['patterns']
         if 'filterPattern' not in metric_filter:
+            self.log.info("No pattern match defined")
             return False
         text = metric_filter['filterPattern']
-        return all(map(lambda pattern: bool(re.search(pattern, text, flags=re.IGNORECASE)), patterns))
+        return all(list(map(lambda pattern: bool(re.search(pattern, text, flags=re.IGNORECASE)), patterns)))
 
     def cloudtrail_matches_filter(self, trail):
+        self.log.info("Checking trail with arn = %s" % trail['TrailARN'])
         logGroupArn = trail.get('CloudWatchLogsLogGroupArn')
         if not logGroupArn:
+            self.log.info("No cloudwatch log group associated with trail")
             return False
         groupName = re.search(':log-group:([^:]+)', logGroupArn).group(1)
         # When we have a shadow group, we need to process the given region instead of the base.
         groupRegion = re.search('arn:aws:logs:([^:]+):', logGroupArn).group(1)
 
+        self.log.info("extracted name = %s, region = %s from arn %s" %(groupName, groupRegion, logGroupArn))
+
         session = local_session(self.manager.session_factory)
 
         filters = self.fetch_metric_filters_for_log_group(session, groupName, groupRegion)
-        matchingFilters = filter(self.text_matches_patterns, filters)
+        matchingFilters = list(filter(self.text_matches_patterns, filters))
         if not matchingFilters:
+            self.log.info("None of the found filters match a pattern")
             return False
 
         # We need to filter the list of transformations to those that emit a value, and then put
         # it into a format we can easily cross compare on.
-        allTransformations = map(lambda filter: filter['metricTransformations'], matchingFilters)
+        allTransformations = list(map(lambda filter: filter['metricTransformations'], matchingFilters))
         transformations = sum(allTransformations, [])
-        emittedMetrics = map(lambda t: (t['metricNamespace'], t['metricName']), transformations)
+        emittedMetrics = list(map(lambda t: (t['metricNamespace'], t['metricName']), transformations))
         if not emittedMetrics:
+            self.log.info("No emitted metrics found from the available metric transformations")
             return False
 
         consideredSet = emittedMetrics
@@ -1897,17 +1929,34 @@ class MonitoredCloudtrailMetric(Filter):
 
             def alarmFilter(alarm):
                 return self.alarm_contains_metrics(alarm, emittedMetrics)
-            filteredAlarms = filter(alarmFilter, metricAlarms)
+            filteredAlarms = list(filter(alarmFilter, metricAlarms))
             if not filteredAlarms:
+                self.log.info("Non alarms in the account region match the defined metrics")
                 return False
             consideredSet = filteredAlarms
             if self.data.get('topic-subscription'):
-                alarmSNSTopics = sum(map(lambda alarm: alarm['AlarmActions'], filteredAlarms), [])
+                ignore_cross_account = self.data.get('ignore-cross-account-authorization', False)
+                alarmSNSTopics = sum(list(map(lambda alarm: alarm['AlarmActions'], filteredAlarms)), [])
                 if not alarmSNSTopics:
+                    self.log.info("No matching SNS topics in alarm actions")
                     return False
-                consideredSet = self.find_subscribed_topic_arns(session, alarmSNSTopics, groupRegion)
+                try:
+                    consideredSet = self.find_subscribed_topic_arns(session, alarmSNSTopics, groupRegion)
+                except ClientError as e:
+                    consideredSet = []
+                    # It's a common practice to have a SNS topic in a seperate account that this listens
+                    # to, and hence this
+                    if e.response['Error']['Code'] == 'AuthorizationError':
+                        self.log.info("Cross account authorization error")
+                        topicAccountIDs = list(map(lambda x: x.split(":")[4], alarmSNSTopics))
+                        currentAccountIDs = list(map(lambda alarm: alarm['AlarmArn'].split(":")[4], filteredAlarms))
+                        otherAccountIDs = [accountID for accountID in topicAccountIDs if accountID not in currentAccountIDs]
+                        if ignore_cross_account and any(topicAccountIDs):
+                            # IF we have any accounts, and we can ignore the cross account set,
+                            # set the list to other accounts as respective.
+                            consideredSet = otherAccountIDs
 
         return any(consideredSet)
 
     def process(self, resources, event=None):
-        return filter(self.account_matches_filters, resources)
+        return list(filter(self.account_matches_filters, resources))
