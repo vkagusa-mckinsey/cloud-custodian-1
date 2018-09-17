@@ -15,7 +15,6 @@ from c7n.utils import (
 from c7n.filters.vpc import SecurityGroupFilter, SubnetFilter
 from c7n.filters import ValueFilter
 
-
 class ConfigTable(query.ConfigSource):
 
     def load_resource(self, item):
@@ -41,9 +40,38 @@ class ConfigTable(query.ConfigSource):
 class DescribeTable(query.DescribeSource):
 
     def augment(self, resources):
-        return universal_augment(
+        initial = universal_augment(
             self.manager,
             super(DescribeTable, self).augment(resources))
+
+        return list(filter(None, _dynamodb_table_backup(
+            self.manager.get_model(),
+            initial,
+            self.manager.session_factory,
+            self.manager.executor_factory,
+            self.manager.retry,
+            self.manager.log)))
+
+def _dynamodb_table_backup(
+        model, tables, session_factory, executor_factory, retry, log):
+    """ Augment DynamoDB tables with their respective backup status
+    """
+
+    def process_backups(table):
+        client = local_session(session_factory).client('dynamodb')
+        name = table['TableName']
+        try:
+            description = retry(
+                client.describe_continuous_backups,
+                TableName=name)['ContinuousBackupsDescription']
+        except ClientError as e:
+            log.warning("Exception getting DynamoDB backups  \n %s", e)
+            return None
+        table['ContiniousBackupDescription'] = description
+        return table
+
+    with executor_factory(max_workers=2) as w:
+        return list(w.map(process_backups, tables))
 
 
 @resources.register('dynamodb-table')
@@ -65,7 +93,6 @@ class Table(query.QueryResourceManager):
         'describe': DescribeTable,
         'config': ConfigTable
     }
-
 
 @Table.filter_registry.register('kms-key')
 class KmsFilter(KmsRelatedFilter):
