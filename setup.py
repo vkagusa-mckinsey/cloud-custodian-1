@@ -23,7 +23,8 @@ install_requires = \
  'python-dateutil>=2.8.1,<3.0.0',
  'pyyaml>=5.3,<6.0',
  'tabulate>=0.8.6,<0.9.0',
- 'rollbar']
+ 'rollbar',
+ 'honeycomb-beeline']
 
 entry_points = \
 {'console_scripts': ['custodian = c7n.cli:main']}

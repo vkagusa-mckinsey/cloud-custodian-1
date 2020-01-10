@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from collections import deque
 import logging
+import beeline
 
 from c7n import cache
 from c7n.executor import ThreadPoolExecutor
@@ -97,6 +98,7 @@ class ResourceManager:
             return klass(self.ctx, {'source': self.source_type})
         return klass(self.ctx, data or {})
 
+    @beeline.traced(name='ResourceManager.filter_resources')
     def filter_resources(self, resources, event=None):
         original = len(resources)
         if event and event.get('debug', False):
