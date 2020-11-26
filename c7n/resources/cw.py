@@ -32,6 +32,37 @@ class Alarm(QueryResourceManager):
     retry = staticmethod(get_retry(('Throttled',)))
 
 
+@Alarm.filter_registry.register('missing-metric')
+class MissingMetricFilter(Filter):
+
+    schema = type_schema('missing-metric', days={'type': 'number'})
+    permissions = ('cloudwatch:GetMetricStatistics',)
+
+    def process(self, resources, event=None):
+        cache = {}
+        client = local_session(self.manager.session_factory).client('cloudwatch')
+        return [r for r in resources if self.metric_is_missing(r, cache, client)]
+
+    def metric_is_missing(self, resource, cache, client):
+        days = self.data.get('days', 14)
+        duration = timedelta(days)
+        now = datetime.utcnow()
+
+        if ('Namespace' not in resource) or ('MetricName' not in resource):
+            return True
+
+        statistics = client.get_metric_statistics(
+            Statistics=['SampleCount'],
+            StartTime=(now - duration),
+            EndTime=now,
+            Period=int(duration.total_seconds()),
+            Namespace=resource['Namespace'],
+            MetricName=resource['MetricName'],
+            Dimensions=resource['Dimensions'])['Datapoints']
+
+        return len(statistics) == 0
+
+
 @Alarm.action_registry.register('delete')
 class AlarmDelete(BaseAction):
     """Delete a cloudwatch alarm.
