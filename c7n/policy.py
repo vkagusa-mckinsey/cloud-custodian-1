@@ -9,6 +9,7 @@ import os
 import time
 
 from dateutil import parser, tz as tzutil
+import beeline
 import jmespath
 
 from c7n.cwe import CloudWatchEvents
@@ -26,6 +27,7 @@ from c7n.version import version
 log = logging.getLogger('c7n.policy')
 
 
+@beeline.traced(name='policy.load')
 def load(options, path, format=None, validate=True, vars=None):
     # should we do os.path.expanduser here?
     if not os.path.exists(path):
@@ -268,6 +270,7 @@ class PullMode(PolicyExecutionMode):
 
     schema = utils.type_schema('pull')
 
+    @beeline.traced(name='PullMode.run')
     def run(self, *args, **kw):
         if not self.policy.is_runnable():
             return []

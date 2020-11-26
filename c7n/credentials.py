@@ -4,13 +4,23 @@
 Authentication utilities
 """
 import os
+import json
+import subprocess
 
 from botocore.credentials import RefreshableCredentials
 from botocore.session import get_session
 from boto3 import Session
+from botocore.exceptions import ClientError
+import logging
 
 from c7n.version import version
 from c7n.utils import get_retry
+
+log = logging.getLogger('custodian.credentials')
+
+
+class UnableToAssumeRole(Exception):
+    pass
 
 
 # we still have some issues (see #5023) to work through to switch to
@@ -21,11 +31,12 @@ USE_STS_REGIONAL = os.environ.get(
 
 class SessionFactory:
 
-    def __init__(self, region, profile=None, assume_role=None, external_id=None):
+    def __init__(self, region, profile=None, assume_role=None, external_id=None, credential_helper=None):
         self.region = region
         self.profile = profile
         self.assume_role = assume_role
         self.external_id = external_id
+        self.credential_helper = credential_helper
         self.user_agent_name = "CloudCustodian"
         self.session_name = "CloudCustodian"
         if 'C7N_SESSION_SUFFIX' in os.environ:
@@ -39,7 +50,10 @@ class SessionFactory:
     policy_name = property(None, _set_policy_name)
 
     def __call__(self, assume=True, region=None):
-        if self.assume_role and assume:
+        if self.credential_helper:
+            session = credential_helper_session(
+                self.credential_helper, self.session_name, region or self.region)
+        elif self.assume_role and assume:
             session = Session(profile_name=self.profile)
             session = assumed_session(
                 self.assume_role, self.session_name, session,
@@ -63,6 +77,65 @@ class SessionFactory:
         self._subscribers = subscribers
 
 
+class CredentialHelperError(Exception):
+    pass
+
+class UnableToParseCredentialOutput(CredentialHelperError):
+    pass
+
+class CredentialHelperExited(CredentialHelperError):
+    pass
+
+def credential_helper_session(command, session_name, region=None):
+    """Role assumption / fetching, using a credential helper.
+
+    The helper program is expected to return the same JSON payload
+    as a call to STS would, just making it possible to use shell scripts.
+
+    The command is run using a shell.
+    """
+
+    def fetch_credentials():
+        env = os.environ.copy()
+        env['CUSTODIAN_SESSION_NAME'] = session_name
+        if region:
+            env['CUSTODIAN_CREDENTIALS_REGION'] = region
+        try:
+            raw_response = subprocess.check_output(command, shell=True, env=env).strip()
+            parseable_string = raw_response.decode('utf-8')
+            parsed = json.loads(parseable_string)
+            credentials = parsed['Credentials']
+
+            return dict(
+                access_key=credentials['AccessKeyId'],
+                secret_key=credentials['SecretAccessKey'],
+                token=credentials['SessionToken'],
+                expiry_time=credentials['Expiration'])
+        except subprocess.CalledProcessError as e:
+            raise CredentialHelperExited("Credential Helper Exited Abnormally with status code %d" % e.returncode)
+        except (AttributeError, TypeError, ValueError, json.decoder.JSONDecodeError):
+            raise UnableToParseCredentialOutput("Unable to parse input:\n%s" % parseable_string)
+
+    session_credentials = RefreshableCredentials.create_from_metadata(
+        metadata=fetch_credentials(),
+        refresh_using=fetch_credentials,
+        method='credential-helper')
+    # so dirty.. it hurts, no clean way to set this outside of the
+    # internals poke. There's some work upstream on making this nicer
+    # but its pretty baroque as well with upstream support.
+    # https://github.com/boto/boto3/issues/443
+    # https://github.com/boto/botocore/issues/761
+
+    s = get_session()
+    s._credentials = session_credentials
+    if region is None:
+        region = s.get_config_variable('region') or 'us-east-1'
+    s.set_config_variable('region', region)
+    return Session(botocore_session=s)
+
+
+
+current_cached_credentials = None
 def assumed_session(role_arn, session_name, session=None, region=None, external_id=None):
     """STS Role assume a boto3.Session
 
@@ -83,25 +156,41 @@ def assumed_session(role_arn, session_name, session=None, region=None, external_
 
     retry = get_retry(('Throttling',))
 
-    def refresh():
+    def refresh(allow_cache=False):
+        global current_cached_credentials
+
+        if allow_cache and current_cached_credentials is not None:
+            log.info("Using in-memory assumed credentials cache")
+            return current_cached_credentials
+
+        log.debug("Fetching fresh credentials from STS")
 
         parameters = {"RoleArn": role_arn, "RoleSessionName": session_name}
-
         if external_id is not None:
             parameters['ExternalId'] = external_id
 
-        credentials = retry(
-            get_sts_client(
-                session, region).assume_role, **parameters)['Credentials']
-        return dict(
+        try:
+            credentials = retry(
+                get_sts_client(
+                    session, region).assume_role, **parameters)['Credentials']
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'AccessDenied':
+                raise UnableToAssumeRole("Unable to assume the specified role.")
+            else:
+                raise
+        normalised_credentials = dict(
             access_key=credentials['AccessKeyId'],
             secret_key=credentials['SecretAccessKey'],
             token=credentials['SessionToken'],
             # Silly that we basically stringify so it can be parsed again
             expiry_time=credentials['Expiration'].isoformat())
+        log.debug("Updating memory credentials cache.")
+        current_cached_credentials = normalised_credentials
+        return normalised_credentials
+
 
     session_credentials = RefreshableCredentials.create_from_metadata(
-        metadata=refresh(),
+        metadata=refresh(True),
         refresh_using=refresh,
         method='sts-assume-role')
 
