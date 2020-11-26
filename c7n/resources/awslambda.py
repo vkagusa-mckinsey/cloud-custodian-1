@@ -12,6 +12,7 @@ from c7n.actions import BaseAction, RemovePolicyBase, ModifyVpcSecurityGroupsAct
 from c7n.filters import CrossAccountAccessFilter, ValueFilter
 from c7n.filters.kms import KmsRelatedFilter
 import c7n.filters.vpc as net_filters
+from c7n.filters.iam import RoleActionEffectFilter
 from c7n.manager import resources
 from c7n import query
 from c7n.resources.iam import CheckPermissions
@@ -246,6 +247,9 @@ class LambdaCrossAccountAccessFilter(CrossAccountAccessFilter):
         return super(LambdaCrossAccountAccessFilter, self).process(
             resources, event)
 
+@AWSLambda.filter_registry.register('role-action-effect')
+class RoleActionEffectFilter(RoleActionEffectFilter):
+    role_arn_selector = "Role"
 
 @AWSLambda.filter_registry.register('kms-key')
 class KmsFilter(KmsRelatedFilter):

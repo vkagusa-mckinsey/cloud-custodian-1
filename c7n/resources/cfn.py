@@ -11,6 +11,7 @@ from c7n.manager import resources
 from c7n.query import QueryResourceManager, TypeInfo
 from c7n.utils import local_session, type_schema
 from c7n.tags import RemoveTag, Tag
+from c7n.filters.iam import RoleActionEffectFilter
 
 log = logging.getLogger('custodian.cfn')
 
@@ -212,7 +213,6 @@ def _tag_stack(client, s, add=(), remove=()):
         Tags=[{'Key': k, 'Value': v} for k, v in tags.items()],
     )
 
-
 @CloudFormation.action_registry.register('remove-tag')
 class CloudFormationRemoveTag(RemoveTag):
     """Action to remove tags from a cloudformation stack
@@ -234,3 +234,7 @@ class CloudFormationRemoveTag(RemoveTag):
     def process_resource_set(self, client, stacks, keys):
         for s in stacks:
             _tag_stack(client, s, remove=keys)
+
+@CloudFormation.filter_registry.register('role-action-effect')
+class RoleActionEffectFilter(RoleActionEffectFilter):
+    role_arn_selector = "RoleARN"
