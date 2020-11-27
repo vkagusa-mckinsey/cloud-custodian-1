@@ -13,8 +13,6 @@ from .aws import shape_validate, Arn
 import re
 
 log = logging.getLogger('c7n.resources.cloudtrail')
-filters = FilterRegistry('cloudtrail.filters')
-
 
 class DescribeTrail(DescribeSource):
 
@@ -41,7 +39,7 @@ class CloudTrail(QueryResourceManager):
         'config': ConfigSource
     }
 
-@filters.register('is-shadow')
+@CloudTrail.filter_registry.register('is-shadow')
 class IsShadow(Filter):
     """Identify shadow trails (secondary copies), shadow trails
     can't be modified directly, the origin trail needs to be modified.
@@ -69,7 +67,7 @@ class IsShadow(Filter):
         return False
 
 
-@filters.register('status')
+@CloudTrail.filter_registry.register('status')
 class Status(ValueFilter):
     """Filter a cloudtrail by its status.
 
@@ -253,7 +251,7 @@ class DeleteTrail(BaseAction):
             except client.exceptions.TrailNotFoundException:
                 continue
 
-@filters.register('monitored-metric')
+@CloudTrail.filter_registry.register('monitored-metric')
 class MonitoredCloudtrailMetric(ValueFilter):
     """Finds cloudtrails with logging and a metric filter. Is a subclass of ValueFilter,
     filtering the metric filter objects. Optionally, verifies an alarm exists (true by default),
@@ -350,7 +348,7 @@ class MonitoredCloudtrailMetric(ValueFilter):
     def process(self, resources, event=None):
         return [resource for resource in resources if self.checkResourceMetricFilters(resource)]
 
-@filters.register('in-home-region')
+@CloudTrail.filter_registry.register('in-home-region')
 class InHomeRegionFilter(Filter):
     """Filters for all cloudtrail trails that are currently in their home region.
 
