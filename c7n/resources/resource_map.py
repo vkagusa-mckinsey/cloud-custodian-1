@@ -72,6 +72,7 @@ ResourceMap = {
     "aws.fsx-backup": "c7n.resources.fsx.FSxBackup",
     "aws.gamelift-build": "c7n.resources.gamelift.GameLiftBuild",
     "aws.gamelift-fleet": "c7n.resources.gamelift.GameLiftFleet",
+    "aws.guardduty-finding": "c7n.resources.guardduty.Finding",
     "aws.glacier": "c7n.resources.glacier.Glacier",
     "aws.glue-connection": "c7n.resources.glue.GlueConnection",
     "aws.glue-crawler": "c7n.resources.glue.GlueCrawler",
