@@ -26,5 +26,5 @@ jobs:
       name: Create pull request
       with:
         source_branch: master
-        destination_branch: stax-provided-patches
+        destination_branch: stax-vendored-patches
         github_token: ${{ secrets.GITHUB_TOKEN }}
