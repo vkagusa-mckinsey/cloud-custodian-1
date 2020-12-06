@@ -28,3 +28,5 @@ jobs:
         source_branch: master
         destination_branch: stax-vendored-patches
         github_token: ${{ secrets.GITHUB_TOKEN }}
+        pr_title: "Update C7N to Master"
+        pr_body: ":crown: :cloud: Magic!"
