@@ -2632,6 +2632,7 @@ class DataEvents(Filter):
 
         event_buckets = {}
         for t in trails:
+          try:
             for events in clients[t.get('HomeRegion')].get_event_selectors(
                     TrailName=t['Name']).get('EventSelectors', ()):
                 if 'DataResources' not in events:
@@ -2641,6 +2642,9 @@ class DataEvents(Filter):
                         continue
                     for b in data_events['Values']:
                         event_buckets[b.rsplit(':')[-1].strip('/')] = t['Name']
+          except ClientError as e:
+            if e.response['Error']['Code'] != 'TrailNotFoundException':
+                raise
         return event_buckets
 
     def process(self, resources, event=None):
