@@ -1,21 +1,8 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 """
 Authentication utilities
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import os
 import json
 import subprocess
@@ -23,9 +10,17 @@ import subprocess
 from botocore.credentials import RefreshableCredentials
 from botocore.session import get_session
 from boto3 import Session
+from botocore.exceptions import ClientError
+import logging
 
 from c7n.version import version
 from c7n.utils import get_retry
+
+log = logging.getLogger('custodian.credentials')
+
+
+class UnableToAssumeRole(Exception):
+    pass
 
 
 # we still have some issues (see #5023) to work through to switch to
@@ -34,7 +29,7 @@ USE_STS_REGIONAL = os.environ.get(
     'C7N_USE_STS_REGIONAL', '').lower() in ('yes', 'true')
 
 
-class SessionFactory(object):
+class SessionFactory:
 
     def __init__(self, region, profile=None, assume_role=None, external_id=None, credential_helper=None):
         self.region = region
@@ -140,6 +135,7 @@ def credential_helper_session(command, session_name, region=None):
 
 
 
+current_cached_credentials = None
 def assumed_session(role_arn, session_name, session=None, region=None, external_id=None):
     """STS Role assume a boto3.Session
 
@@ -160,25 +156,41 @@ def assumed_session(role_arn, session_name, session=None, region=None, external_
 
     retry = get_retry(('Throttling',))
 
-    def refresh():
+    def refresh(allow_cache=False):
+        global current_cached_credentials
+
+        if allow_cache and current_cached_credentials is not None:
+            log.info("Using in-memory assumed credentials cache")
+            return current_cached_credentials
+
+        log.debug("Fetching fresh credentials from STS")
 
         parameters = {"RoleArn": role_arn, "RoleSessionName": session_name}
-
         if external_id is not None:
             parameters['ExternalId'] = external_id
 
-        credentials = retry(
-            get_sts_client(
-                session, region).assume_role, **parameters)['Credentials']
-        return dict(
+        try:
+            credentials = retry(
+                get_sts_client(
+                    session, region).assume_role, **parameters)['Credentials']
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'AccessDenied':
+                raise UnableToAssumeRole("Unable to assume the specified role.")
+            else:
+                raise
+        normalised_credentials = dict(
             access_key=credentials['AccessKeyId'],
             secret_key=credentials['SecretAccessKey'],
             token=credentials['SessionToken'],
             # Silly that we basically stringify so it can be parsed again
             expiry_time=credentials['Expiration'].isoformat())
+        log.debug("Updating memory credentials cache.")
+        current_cached_credentials = normalised_credentials
+        return normalised_credentials
+
 
     session_credentials = RefreshableCredentials.create_from_metadata(
-        metadata=refresh(),
+        metadata=refresh(True),
         refresh_using=refresh,
         method='sts-assume-role')
 

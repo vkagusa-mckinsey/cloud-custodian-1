@@ -1,31 +1,23 @@
-# Copyright 2017-2019 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import logging
 
 from c7n.actions import Action, BaseAction
 from c7n.exceptions import PolicyValidationError
-from c7n.filters import ValueFilter, Filter
+from c7n.filters import ValueFilter, Filter, FilterRegistry, OPERATORS
 from c7n.manager import resources
 from c7n.tags import universal_augment
-from c7n.query import DescribeSource, QueryResourceManager, TypeInfo
+from c7n.query import ConfigSource, DescribeSource, QueryResourceManager, TypeInfo
 from c7n.utils import local_session, type_schema
-
 from .aws import shape_validate, Arn
+import re
 
 log = logging.getLogger('c7n.resources.cloudtrail')
+
+class DescribeTrail(DescribeSource):
+
+    def augment(self, resources):
+        return universal_augment(self.manager, resources)
 
 
 @resources.register('cloudtrail')
@@ -36,22 +28,16 @@ class CloudTrail(QueryResourceManager):
         enum_spec = ('describe_trails', 'trailList', None)
         filter_name = 'trailNameList'
         filter_type = 'list'
+        arn_type = 'trail'
         arn = id = 'TrailARN'
         name = 'Name'
-        config_type = "AWS::CloudTrail::Trail"
+        cfn_type = config_type = "AWS::CloudTrail::Trail"
         universal_taggable = object()
 
-    def get_source(self, source_type):
-        if source_type == 'describe':
-            return DescribeTrail(self)
-        return super(CloudTrail, self).get_source(source_type)
-
-
-class DescribeTrail(DescribeSource):
-
-    def augment(self, resources):
-        return universal_augment(self.manager, resources)
-
+    source_mapping = {
+        'describe': DescribeTrail,
+        'config': ConfigSource
+    }
 
 @CloudTrail.filter_registry.register('is-shadow')
 class IsShadow(Filter):
@@ -104,12 +90,16 @@ class Status(ValueFilter):
     annotation_key = 'c7n:TrailStatus'
 
     def process(self, resources, event=None):
+
+        non_account_trails = set()
+
         for r in resources:
             region = self.manager.config.region
             trail_arn = Arn.parse(r['TrailARN'])
 
             if (r.get('IsOrganizationTrail') and
                     self.manager.config.account_id != trail_arn.account_id):
+                non_account_trails.add(r['TrailARN'])
                 continue
             if r.get('HomeRegion') and r['HomeRegion'] != region:
                 region = trail_arn.region
@@ -121,7 +111,12 @@ class Status(ValueFilter):
             status.pop('ResponseMetadata')
             r[self.annotation_key] = status
 
-        return super(Status, self).process(resources)
+        if non_account_trails:
+            self.log.warning(
+                'found %d org cloud trail from different account that cant be processed',
+                len(non_account_trails))
+        return super(Status, self).process([
+            r for r in resources if r['TrailARN'] not in non_account_trails])
 
     def __call__(self, r):
         return self.match(r['c7n:TrailStatus'])
@@ -221,6 +216,7 @@ class SetLogging(Action):
                 client.stop_logging(Name=r['Name'])
 
 
+
 @CloudTrail.action_registry.register('delete')
 class DeleteTrail(BaseAction):
     """ Delete a cloud trail
@@ -254,3 +250,139 @@ class DeleteTrail(BaseAction):
                 client.delete_trail(Name=r['Name'])
             except client.exceptions.TrailNotFoundException:
                 continue
+
+@CloudTrail.filter_registry.register('monitored-metric')
+class MonitoredCloudtrailMetric(ValueFilter):
+    """Finds cloudtrails with logging and a metric filter. Is a subclass of ValueFilter,
+    filtering the metric filter objects. Optionally, verifies an alarm exists (true by default),
+    and for said alarm, there is atleast one SNS subscription (again, true by default).
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: cloudtrail-trail-with-login-attempts
+                resource: cloudtrail
+                region: us-east-1
+                filters:
+                  - type: monitored-metric
+                    alarm: true
+                    topic-subscription: false
+                    filter: '$.eventName = DeleteTrail'
+    """
+
+    schema = type_schema('monitored-metric', rinherit=ValueFilter.schema, **{
+        'topic-subscription': {'type': 'boolean'},
+        'alarm': {'type': 'boolean'}
+    })
+
+    permissions = ('logs:DescribeMetricFilters', 'cloudwatch:DescribeAlarms',
+        'sns:ListSubscriptionsByTopic')
+
+    def _filterTopicArnsToSubscribed(self, session, topicArns):
+        sns = session.client('sns')
+
+        def arnHasSubscriptions(arn):
+            subscriptions = sns.list_subscriptions_by_topic(TopicArn=arn)['Subscriptions']
+            return any(subscriptions)
+        return filter(arnHasSubscriptions, topicArns)
+
+    def _allAlarms(self):
+        return self.manager.get_resource_manager('alarm').resources()
+
+    def _metricFiltersForLogGroup(self, session, groupName):
+        logs = session.client('logs')
+        paginator = logs.get_paginator('describe_metric_filters')
+        results = paginator.paginate(logGroupName=groupName).build_full_result()
+        return results['metricFilters']
+
+    def _alarmInMetrics(self, alarm, metrics):
+        pair = (alarm['Namespace'], alarm['MetricName'])
+        return pair in metrics
+
+    def checkResourceMetricFilters(self, resource):
+        logGroupArn = resource.get('CloudWatchLogsLogGroupArn')
+        if not logGroupArn:
+            return False
+
+        session = local_session(self.manager.session_factory)
+
+        groupName = re.search(':log-group:([^:]+)', logGroupArn).group(1)
+        filters = self._metricFiltersForLogGroup(session, groupName)
+        matchingFilters = filter(lambda mf: self.match(mf), filters)
+        if not matchingFilters:
+            return False
+        resource['c7n:matching-metric-filters'] = matchingFilters
+
+        # We need to filter the list of transformations to those that emit a value, and then put
+        # it into a format we can easily cross compare on.
+        allTransformations = map(lambda filter: filter['metricTransformations'], matchingFilters)
+        transformations = sum(allTransformations, [])
+        emittedMetrics = map(lambda t: (t['metricNamespace'], t['metricName']), transformations)
+        if not emittedMetrics:
+            return False
+        resource['c7n:emitted-metric-filters'] = emittedMetrics
+
+        consideredSet = emittedMetrics
+
+        if self.data.get('alarm', True):
+            metricAlarms = self._allAlarms()
+
+            def alarmFilter(alarm):
+                return self._alarmInMetrics(alarm, emittedMetrics)
+            filteredAlarms = filter(alarmFilter, metricAlarms)
+            if not filteredAlarms:
+                return False
+            consideredSet = filteredAlarms
+            resource['c7n:metric-filter-alarms'] = filteredAlarms
+            if self.data.get('topic-subscription'):
+                alarmSNSTopics = sum(map(lambda alarm: alarm['AlarmActions'], filteredAlarms), [])
+                if not alarmSNSTopics:
+                    return False
+                consideredSet = self._filterTopicArnsToSubscribed(session, alarmSNSTopics)
+                resource['c7n:subscribed-metric-filter-alarm-topics'] = consideredSet
+
+        return any(consideredSet)
+
+    def process(self, resources, event=None):
+        return [resource for resource in resources if self.checkResourceMetricFilters(resource)]
+
+@CloudTrail.filter_registry.register('in-home-region')
+class InHomeRegionFilter(Filter):
+    """Filters for all cloudtrail trails that are currently in their home region.
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: cloudtrail-in-home-region
+                resource: cloudtrail
+                filters:
+                  - type: in-home-region
+                actions:
+                  - delete-global-grants
+    """
+    schema = type_schema('in-home-region')
+
+    def process(self, trails, event=None):
+        session = local_session(self.manager.session_factory)
+        current_region = session.region_name
+        return [t for t in trails if t['HomeRegion'] == current_region]
+
+@CloudTrail.filter_registry.register('trail-status')
+class TrailStatusFilter(ValueFilter):
+    schema = type_schema('trail-status', rinherit=ValueFilter.schema)
+    permissions = ('cloudtrail:GetTrailStatus',)
+
+    def process(self, resources, event=None):
+        client = local_session(self.manager.session_factory).client('cloudtrail')
+        matches = []
+        for item in resources:
+            if 'c7n:TrailStatus' not in item:
+                status = self.manager.retry(client.get_trail_status, Name=item['TrailARN'])
+                item['c7n:TrailStatus'] = status
+            if self.match(item['c7n:TrailStatus']):
+                matches.append(item)
+        return matches

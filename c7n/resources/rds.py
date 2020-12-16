@@ -1,16 +1,5 @@
-# Copyright 2015-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 """
 RDS Resource Manager
 ====================
@@ -42,16 +31,15 @@ Find rds instances that are not encrypted
            op: ne
 
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import functools
 import itertools
 import logging
 import operator
+import jmespath
 import re
 from decimal import Decimal as D, ROUND_HALF_UP
 
-from distutils.version import LooseVersion
+from c7n.filters.core import ComparableVersion
 from botocore.exceptions import ClientError
 from concurrent.futures import as_completed
 
@@ -79,6 +67,24 @@ filters = FilterRegistry('rds.filters')
 actions = ActionRegistry('rds.actions')
 
 
+class DescribeRDS(DescribeSource):
+
+    def augment(self, dbs):
+        for d in dbs:
+            d['Tags'] = d.pop('TagList', ())
+        return dbs
+
+
+class ConfigRDS(ConfigSource):
+
+    def load_resource(self, item):
+        resource = super().load_resource(item)
+        for k in list(resource.keys()):
+            if k.startswith('Db'):
+                resource["DB%s" % k[2:]] = resource[k]
+        return resource
+
+
 @resources.register('rds')
 class RDS(QueryResourceManager):
     """Resource manager for RDS DB instances.
@@ -95,7 +101,7 @@ class RDS(QueryResourceManager):
         filter_type = 'scalar'
         date = 'InstanceCreateTime'
         dimension = 'DBInstanceIdentifier'
-        config_type = 'AWS::RDS::DBInstance'
+        cfn_type = config_type = 'AWS::RDS::DBInstance'
         arn = 'DBInstanceArn'
         universal_taggable = True
         default_report_fields = (
@@ -109,33 +115,15 @@ class RDS(QueryResourceManager):
             'PubliclyAccessible',
             'InstanceCreateTime',
         )
+        permissions_enum = ('rds:DescribeDBInstances',)
 
     filter_registry = filters
     action_registry = actions
 
-    def get_source(self, source_type):
-        if source_type == 'describe':
-            return DescribeRDS(self)
-        elif source_type == 'config':
-            return ConfigRDS(self)
-        raise ValueError("Unsupported source: %s for %s" % (
-            source_type, self.resource_type.config_type))
-
-
-class DescribeRDS(DescribeSource):
-
-    def augment(self, dbs):
-        return universal_augment(
-            self.manager, super(DescribeRDS, self).augment(dbs))
-
-
-class ConfigRDS(ConfigSource):
-
-    def load_resource(self, item):
-        resource = super(ConfigRDS, self).load_resource(item)
-        resource['Tags'] = [{u'Key': t['key'], u'Value': t['value']}
-          for t in item['supplementaryConfiguration']['Tags']]
-        return resource
+    source_mapping = {
+        'describe': DescribeRDS,
+        'config': ConfigRDS
+    }
 
 
 def _db_instance_eligible_for_backup(resource):
@@ -228,6 +216,8 @@ def _get_available_engine_upgrades(client, major=False):
     results = {}
     paginator = client.get_paginator('describe_db_engine_versions')
     for page in paginator.paginate():
+        # DBEngineVersions is an ordered list, based on all data seen so far.
+        # it is not explicitly called out as such.
         engine_versions = page['DBEngineVersions']
         for v in engine_versions:
             if not v['Engine'] in results:
@@ -237,9 +227,10 @@ def _get_available_engine_upgrades(client, major=False):
             for t in v['ValidUpgradeTarget']:
                 if not major and t['IsMajorVersionUpgrade']:
                     continue
-                if LooseVersion(t['EngineVersion']) > LooseVersion(
-                        results[v['Engine']].get(v['EngineVersion'], '0.0.0')):
-                    results[v['Engine']][v['EngineVersion']] = t['EngineVersion']
+                target_version = t['EngineVersion']
+                latest_version = results[v['Engine']].get(v['EngineVersion'], '0.0.0')
+                if ComparableVersion(target_version) > ComparableVersion(latest_version):
+                    results[v['Engine']][v['EngineVersion']] = target_version
     return results
 
 
@@ -382,7 +373,85 @@ class UpgradeAvailable(Filter):
                     results.append(r)
                 continue
             r['c7n-rds-engine-upgrade'] = target_upgrade
+
+            if 'c7n:rds-version-targets' not in r:
+                r['c7n:rds-version-targets'] = {}
+            version_key = 'major' if check_major else 'minor'
+            r['c7n:rds-version-targets'][version_key] = target_upgrade
+
             results.append(r)
+        return results
+
+
+@filters.register('public-subnet')
+class PublicSubnet(Filter):
+    """ Scan DB instances for those in public subnets.
+
+    Checks for RDS instances in subnets that are publicly routable.
+
+    Based on https://github.com/awslabs/aws-config-rules/blob/master/python/rds_vpc_public_subnet.py
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: rds-with-public-subnet
+                resource: rds
+                filters:
+                  - type: public-subnet
+
+    """
+
+    schema = type_schema('public-subnet',
+                         major={'type': 'boolean'},
+                         value={'type': 'boolean'})
+    permissions = ('ec2:DescribeRouteTables',)
+
+    def process(self, resources, event=None):
+        route_tables = self.manager.get_resource_manager('route-table').resources()
+        results = []
+        for instance in resources:
+            vpc_id = instance['DBSubnetGroup']['VpcId']
+            subnet_ids = [s['SubnetIdentifier'] for s in instance['DBSubnetGroup']['Subnets']]
+
+            private = True
+
+            def public_route(route):
+                public_destination = 'DestinationCidrBlock' in route and route['DestinationCidrBlock'] == '0.0.0.0/0'
+                has_igw = 'GatewayId' in route and route['GatewayId'].startswith('igw-')
+                return public_destination or has_igw
+
+            for subnet_id in subnet_ids:
+                main_table_is_public = False
+                no_explicit_association = True
+                explicit_association_is_public = False
+
+                relevant_tables = [rt for rt in route_tables if rt['VpcId'] == vpc_id]
+                for route_table in relevant_tables:
+                    for association in route_table['Associations']:
+                        if association['Main'] == True:
+                            for route in route_table['Routes']:
+                                if public_route(route):
+                                    main_table_is_public = True
+                        elif association['SubnetId'] == subnet_id:
+                            no_explicit_association = False
+                            for route in route_table['Routes']:
+                                if public_route(route):
+                                    explicit_association_is_public = True
+
+            if (main_table_is_public and no_explicit_association) or explicit_association_is_public:
+                private = False
+
+            instance['c7n:PublicSubnet'] = {
+                'Private': private,
+                'MainTableIsPublic': main_table_is_public,
+                'NoExplicitAssociation': no_explicit_association,
+                'ExplicitAssociationIsPublic': explicit_association_is_public
+            }
+
+            if not private:
+                results.append(instance)
         return results
 
 
@@ -649,7 +718,7 @@ class CopySnapshotTags(BaseAction):
     schema = type_schema(
         'set-snapshot-copy-tags',
         enable={'type': 'boolean'})
-    permissions = ('rds:ModifyDBInstances',)
+    permissions = ('rds:ModifyDBInstance',)
 
     def process(self, resources):
         error = None
@@ -929,16 +998,56 @@ class RDSSubscription(QueryResourceManager):
 
     class resource_type(TypeInfo):
         service = 'rds'
-        arn_type = 'rds-subscription'
+        arn_type = 'es'
+        cfn_type = 'AWS::RDS::EventSubscription'
         enum_spec = (
             'describe_event_subscriptions', 'EventSubscriptionsList', None)
-        name = id = "EventSubscriptionArn"
+        name = id = "CustSubscriptionId"
+        arn = 'EventSubscriptionArn'
         date = "SubscriptionCreateTime"
-        config_type = "AWS::DB::EventSubscription"
-        # SubscriptionName isn't part of describe events results?! all the
-        # other subscription apis.
-        # filter_name = 'SubscriptionName'
-        # filter_type = 'scalar'
+        permissions_enum = ('rds:DescribeEventSubscriptions',)
+        universal_taggable = object()
+
+    augment = universal_augment
+
+
+@RDSSubscription.action_registry.register('delete')
+class RDSSubscriptionDelete(BaseAction):
+    """Deletes a RDS snapshot resource
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: rds-subscription-delete
+                resource: rds-subscription
+                filters:
+                  - type: value
+                    key: CustSubscriptionId
+                    value: xyz
+                actions:
+                  - delete
+    """
+
+    schema = type_schema('delete')
+    permissions = ('rds:DeleteEventSubscription',)
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('rds')
+        for r in resources:
+            self.manager.retry(
+                client.delete_event_subscription, SubscriptionName=r['CustSubscriptionId'],
+                ignore_err_codes=('SubscriptionNotFoundFault',
+                'InvalidEventSubscriptionStateFault'))
+
+
+class DescribeRDSSnapshot(DescribeSource):
+
+    def augment(self, snaps):
+        for s in snaps:
+            s['Tags'] = s.pop('TagList', ())
+        return snaps
 
 
 @resources.register('rds-snapshot')
@@ -956,31 +1065,12 @@ class RDSSnapshot(QueryResourceManager):
         config_type = "AWS::RDS::DBSnapshot"
         filter_name = "DBSnapshotIdentifier"
         universal_taggable = True
+        permissions_enum = ('rds:DescribeDBSnapshots',)
 
-    def get_source(self, source_type):
-        if source_type == 'describe':
-            return DescribeRDSSnapshot(self)
-        elif source_type == 'config':
-            return ConfigRDSSnapshot(self)
-        raise ValueError("Unsupported source: %s for %s" % (
-            source_type, self.resource_type.config_type))
-
-
-class DescribeRDSSnapshot(DescribeSource):
-
-    def augment(self, snaps):
-        return universal_augment(
-            self.manager, super(DescribeRDSSnapshot, self).augment(snaps))
-
-
-class ConfigRDSSnapshot(ConfigSource):
-
-    def load_resource(self, item):
-        resource = super(ConfigRDSSnapshot, self).load_resource(item)
-        resource['Tags'] = [{u'Key': t['key'], u'Value': t['value']}
-          for t in item['supplementaryConfiguration']['Tags']]
-        # TODO: Load DBSnapshotAttributes into annotation
-        return resource
+    source_mapping = {
+        'describe': DescribeRDSSnapshot,
+        'config': ConfigSource
+    }
 
 
 @RDSSnapshot.filter_registry.register('onhour')
@@ -1062,10 +1152,10 @@ class RestoreInstance(BaseAction):
         'rds:RestoreDBInstanceFromDBSnapshot')
 
     poll_period = 60
-    restore_keys = set((
+    restore_keys = {
         'VPCSecurityGroups', 'MultiAZ', 'DBSubnetGroupName',
         'InstanceClass', 'StorageType', 'ParameterGroupName',
-        'OptionGroupName'))
+        'OptionGroupName'}
 
     def validate(self):
         found = False
@@ -1172,7 +1262,8 @@ class CrossAccountAccess(CrossAccountAccessFilter):
         results = []
         for r in resource_set:
             attrs = {t['AttributeName']: t['AttributeValues']
-             for t in client.describe_db_snapshot_attributes(
+             for t in self.manager.retry(
+                client.describe_db_snapshot_attributes,
                 DBSnapshotIdentifier=r['DBSnapshotIdentifier'])[
                     'DBSnapshotAttributesResult']['DBSnapshotAttributes']}
             r['c7n:attributes'] = attrs
@@ -1197,7 +1288,7 @@ class RegionCopySnapshot(BaseAction):
       - name: copy-encrypted-snapshots
         description: |
           copy snapshots under 1 day old to dr region with kms
-        resource: rdb-snapshot
+        resource: rds-snapshot
         region: us-east-1
         filters:
          - Status: available
@@ -1212,7 +1303,7 @@ class RegionCopySnapshot(BaseAction):
             target_key: arn:aws:kms:us-east-2:0000:key/cb291f53-c9cf61
             copy_tags: true
             tags:
-              - OriginRegion: us-east-1
+              OriginRegion: us-east-1
     """
 
     schema = type_schema(
@@ -1365,23 +1456,36 @@ class RDSModifyVpcSecurityGroups(ModifyVpcSecurityGroupsAction):
             )
 
 
+class DescribeSubnetGroup(DescribeSource):
+
+    def augment(self, resources):
+        _db_subnet_group_tags(
+            resources, self.manager.session_factory,
+            self.manager.executor_factory, self.manager.retry)
+        return resources
+
+
 @resources.register('rds-subnet-group')
 class RDSSubnetGroup(QueryResourceManager):
     """RDS subnet group."""
 
     class resource_type(TypeInfo):
         service = 'rds'
-        arn_type = 'rds-subnet-group'
+        arn_type = 'subgrp'
         id = name = 'DBSubnetGroupName'
+        arn_separator = ':'
         enum_spec = (
             'describe_db_subnet_groups', 'DBSubnetGroups', None)
         filter_name = 'DBSubnetGroupName'
         filter_type = 'scalar'
+        permissions_enum = ('rds:DescribeDBSubnetGroups',)
+        cfn_type = config_type = 'AWS::RDS::DBSubnetGroup'
+        universal_taggable = object()
 
-    def augment(self, resources):
-        _db_subnet_group_tags(
-            resources, self.session_factory, self.executor_factory, self.retry)
-        return resources
+    source_mapping = {
+        'config': ConfigSource,
+        'describe': DescribeSubnetGroup
+    }
 
 
 def _db_subnet_group_tags(subnet_groups, session_factory, executor_factory, retry):
@@ -1452,9 +1556,9 @@ class UnusedRDSSubnetGroup(Filter):
 
     def process(self, configs, event=None):
         rds = self.manager.get_resource_manager('rds').resources()
-        self.used = set([
-            r.get('DBSubnetGroupName', r['DBInstanceIdentifier'])
-            for r in rds])
+        self.used = set(jmespath.search('[].DBSubnetGroup.DBSubnetGroupName', rds))
+        self.used.update(set(jmespath.search('[].DBSubnetGroup.DBSubnetGroupName',
+            self.manager.get_resource_manager('rds-cluster').resources(augment=False))))
         return super(UnusedRDSSubnetGroup, self).process(configs)
 
     def __call__(self, config):
@@ -1609,6 +1713,7 @@ class ModifyDb(BaseAction):
                         'Domain',
                         'CopyTagsToSnapshot',
                         'MonitoringInterval',
+                        'MonitoringRoleARN',
                         'DBPortNumber',
                         'PubliclyAccessible',
                         'DomainIAMRoleName',
@@ -1618,8 +1723,11 @@ class ModifyDb(BaseAction):
                         'PerformanceInsightsKMSKeyId',
                         'PerformanceInsightsRetentionPeriod',
                         'CloudwatchLogsExportConfiguration',
+                        'ProcessorFeatures',
                         'UseDefaultProcessorFeatures',
-                        'DeletionProtection']},
+                        'DeletionProtection',
+                        'MaxAllocatedStorage',
+                        'CertificateRotationRestart']},
                     'value': {}
                 },
             },
@@ -1627,15 +1735,45 @@ class ModifyDb(BaseAction):
         required=('update',))
 
     permissions = ('rds:ModifyDBInstance',)
+    conversion_map = {
+        'DBSubnetGroupName': 'DBSubnetGroup.DBSubnetGroupName',
+        'VpcSecurityGroupIds': 'VpcSecurityGroups[].VpcSecurityGroupId',
+        'DBParameterGroupName': 'DBParameterGroups[].DBParameterGroupName',
+        'OptionGroupName': 'OptionGroupMemberships[].OptionGroupName',
+        'NewDBInstanceIdentifier': 'DBInstanceIdentifier',
+        'Domain': 'DomainMemberships[].DomainName',
+        'DBPortNumber': 'Endpoint.Port',
+        'EnablePerformanceInsights': 'PerformanceInsightsEnabled',
+        'CloudwatchLogsExportConfiguration': 'EnabledCloudwatchLogsExports'
+    }
+
+    def validate(self):
+        if self.data.get('update'):
+            update_dict = dict((i['property'], i['value']) for i in self.data.get('update'))
+            if ('MonitoringInterval' in update_dict and update_dict['MonitoringInterval'] > 0 and
+                    'MonitoringRoleARN' not in update_dict):
+                raise PolicyValidationError(
+                    "A MonitoringRoleARN value is required \
+                    if you specify a MonitoringInterval value other than 0")
+            if ('CloudwatchLogsExportConfiguration' in update_dict
+                and all(
+                    k not in update_dict.get('CloudwatchLogsExportConfiguration')
+                    for k in ('EnableLogTypes', 'DisableLogTypes'))):
+                raise PolicyValidationError(
+                    "A EnableLogTypes or DisableLogTypes input list is required\
+                    for setting CloudwatchLogsExportConfiguration")
+        return self
 
     def process(self, resources):
         c = local_session(self.manager.session_factory).client('rds')
-
         for r in resources:
-            param = {}
-            for update in self.data.get('update'):
-                if r[update['property']] != update['value']:
-                    param[update['property']] = update['value']
+            param = {
+                u['property']: u['value'] for u in self.data.get('update')
+                if r.get(
+                    u['property'],
+                    jmespath.search(
+                        self.conversion_map.get(u['property'], 'None'), r))
+                    != u['value']}
             if not param:
                 continue
             param['ApplyImmediately'] = self.data.get('immediate', False)
@@ -1657,5 +1795,9 @@ class ReservedRDS(QueryResourceManager):
             'describe_reserved_db_instances', 'ReservedDBInstances', None)
         filter_name = 'ReservedDBInstances'
         filter_type = 'list'
-        arn_type = "reserved-db"
+        arn_type = "ri"
         arn = "ReservedDBInstanceArn"
+        permissions_enum = ('rds:DescribeReservedDBInstances',)
+        universal_taggable = object()
+
+    augment = universal_augment

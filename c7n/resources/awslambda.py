@@ -1,21 +1,8 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-from __future__ import absolute_import, division, print_function, unicode_literals
-
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 import jmespath
 import json
-import six
+from urllib.parse import urlparse, parse_qs
 
 from botocore.exceptions import ClientError
 from botocore.paginate import Paginator
@@ -23,14 +10,50 @@ from concurrent.futures import as_completed
 
 from c7n.actions import BaseAction, RemovePolicyBase, ModifyVpcSecurityGroupsAction
 from c7n.filters import CrossAccountAccessFilter, ValueFilter
+from c7n.filters.kms import KmsRelatedFilter
 import c7n.filters.vpc as net_filters
+from c7n.filters.iam import RoleActionEffectFilter
 from c7n.manager import resources
 from c7n import query
 from c7n.resources.iam import CheckPermissions
 from c7n.tags import universal_augment
-from c7n.utils import local_session, type_schema
+from c7n.utils import local_session, type_schema, select_keys
+
+from .securityhub import PostFinding
 
 ErrAccessDenied = "AccessDeniedException"
+
+
+class DescribeLambda(query.DescribeSource):
+
+    def augment(self, resources):
+        return universal_augment(
+            self.manager, super(DescribeLambda, self).augment(resources))
+
+    def get_resources(self, ids):
+        client = local_session(self.manager.session_factory).client('lambda')
+        resources = []
+        for rid in ids:
+            try:
+                func = self.manager.retry(client.get_function, FunctionName=rid)
+            except client.exceptions.ResourceNotFoundException:
+                continue
+            config = func.pop('Configuration')
+            config.update(func)
+            if 'Tags' in config:
+                config['Tags'] = [
+                    {'Key': k, 'Value': v} for k, v in config['Tags'].items()]
+            resources.append(config)
+        return resources
+
+
+class ConfigLambda(query.ConfigSource):
+
+    def load_resource(self, item):
+        resource = super(ConfigLambda, self).load_resource(item)
+        resource['c7n:Policy'] = item[
+            'supplementaryConfiguration'].get('Policy')
+        return resource
 
 
 @resources.register('lambda')
@@ -44,35 +67,17 @@ class AWSLambda(query.QueryResourceManager):
         name = id = 'FunctionName'
         date = 'LastModified'
         dimension = 'FunctionName'
-        config_type = "AWS::Lambda::Function"
+        config_type = 'AWS::Lambda::Function'
+        cfn_type = 'AWS::Lambda::Function'
         universal_taggable = object()
 
-    def get_source(self, source_type):
-        if source_type == 'describe':
-            return DescribeLambda(self)
-        elif source_type == 'config':
-            return ConfigLambda(self)
-        raise ValueError("Unsupported source: %s for %s" % (
-            source_type, self.resource_type.config_type))
+    source_mapping = {
+        'describe': DescribeLambda,
+        'config': ConfigLambda
+    }
 
-
-class DescribeLambda(query.DescribeSource):
-
-    def augment(self, resources):
-        return universal_augment(
-            self.manager, super(DescribeLambda, self).augment(resources))
-
-
-class ConfigLambda(query.ConfigSource):
-
-    def load_resource(self, item):
-        resource = super(ConfigLambda, self).load_resource(item)
-        resource['Tags'] = [
-            {u'Key': k, u'Value': v} for k, v in item[
-                'supplementaryConfiguration'].get('Tags', {}).items()]
-        resource['c7n:Policy'] = item[
-            'supplementaryConfiguration'].get('Policy')
-        return resource
+    def get_resources(self, ids, cache=True, augment=False):
+        return super(AWSLambda, self).get_resources(ids, cache, augment)
 
 
 @AWSLambda.filter_registry.register('security-group')
@@ -242,6 +247,74 @@ class LambdaCrossAccountAccessFilter(CrossAccountAccessFilter):
         return super(LambdaCrossAccountAccessFilter, self).process(
             resources, event)
 
+@AWSLambda.filter_registry.register('role-action-effect')
+class RoleActionEffectFilter(RoleActionEffectFilter):
+    role_arn_selector = "Role"
+
+@AWSLambda.filter_registry.register('kms-key')
+class KmsFilter(KmsRelatedFilter):
+    """
+    Filter a resource by its associcated kms key and optionally the aliasname
+    of the kms key by using 'c7n:AliasName'
+
+    :example:
+
+        .. code-block:: yaml
+
+            policies:
+                - name: lambda-kms-key-filters
+                  resource: aws.lambda
+                  filters:
+                    - type: kms-key
+                      key: c7n:AliasName
+                      value: "^(alias/aws/lambda)"
+                      op: regex
+    """
+    RelatedIdsExpression = 'KMSKeyArn'
+
+
+@AWSLambda.action_registry.register('post-finding')
+class LambdaPostFinding(PostFinding):
+
+    resource_type = 'AwsLambdaFunction'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        # security hub formatting beggars belief
+        details = self.filter_empty(select_keys(r,
+            ['CodeSha256',
+             'DeadLetterConfig',
+             'Environment',
+             'Handler',
+             'KMSKeyArn',
+             'LastModified',
+             'MemorySize',
+             'MasterArn',
+             'RevisionId',
+             'Role',
+             'Runtime',
+             'TracingConfig',
+             'Timeout',
+             'Version',
+             'VpcConfig']))
+        # do the brain dead parts Layers, Code, TracingConfig
+        if 'Layers' in r:
+            r['Layers'] = {
+                'Arn': r['Layers'][0]['Arn'],
+                'CodeSize': r['Layers'][0]['CodeSize']}
+        details.get('VpcConfig', {}).pop('VpcId', None)
+
+        if 'Code' in r and r['Code'].get('RepositoryType') == "S3":
+            parsed = urlparse(r['Code']['Location'])
+            details['Code'] = {
+                'S3Bucket': parsed.netloc.split('.', 1)[0],
+                'S3Key': parsed.path[1:]}
+            params = parse_qs(parsed.query)
+            if params['versionId']:
+                details['Code']['S3ObjectVersion'] = params['versionId'][0]
+        payload.update(details)
+        return envelope
+
 
 @AWSLambda.action_registry.register('remove-statements')
 class RemovePolicyStatement(RemovePolicyBase):
@@ -330,7 +403,7 @@ class SetConcurrency(BaseAction):
                    'lambda:PutFunctionConcurrency')
 
     def validate(self):
-        if self.data.get('expr', False) and not isinstance(self.data['value'], six.text_type):
+        if self.data.get('expr', False) and not isinstance(self.data['value'], str):
             raise ValueError("invalid value expression %s" % self.data['value'])
         return self
 
@@ -444,6 +517,7 @@ class LambdaLayerVersion(query.QueryResourceManager):
         date = 'CreatedDate'
         arn = "LayerVersionArn"
         arn_type = "layer"
+        cfn_type = 'AWS::Lambda::LayerVersion'
 
     def augment(self, resources):
         versions = {}
@@ -559,3 +633,15 @@ class DeleteLayerVersion(BaseAction):
                     VersionNumber=r['Version'])
             except client.exceptions.ResourceNotFound:
                 continue
+
+
+@LambdaLayerVersion.action_registry.register('post-finding')
+class LayerPostFinding(PostFinding):
+
+    resource_type = 'AwsLambdaLayerVersion'
+
+    def format_resource(self, r):
+        envelope, payload = self.format_envelope(r)
+        payload.update(self.filter_empty(
+            select_keys(r, ['Version', 'CreatedDate', 'CompatibleRuntimes'])))
+        return envelope

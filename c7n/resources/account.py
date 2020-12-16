@@ -1,25 +1,14 @@
-# Copyright 2016-2017 Capital One Services, LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright The Cloud Custodian Authors.
+# SPDX-License-Identifier: Apache-2.0
 """AWS Account as a custodian resource.
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
-
 import json
 import time
+import datetime
+import re
 from botocore.exceptions import ClientError
-from datetime import datetime, timedelta
-
+from fnmatch import fnmatch
+import logging
 from dateutil.parser import parse as parse_date
 from dateutil.tz import tzutc
 
@@ -31,10 +20,12 @@ from c7n.filters.multiattr import MultiAttrFilter
 from c7n.filters.missing import Missing
 from c7n.manager import ResourceManager, resources
 from c7n.utils import local_session, type_schema, generate_arn
-from c7n.query import QueryResourceManager
+from c7n.query import QueryResourceManager, TypeInfo
 
 from c7n.resources.iam import CredentialReport
 from c7n.resources.securityhub import OtherResourcePostFinding
+
+from .aws import shape_validate
 
 filters = FilterRegistry('aws.account.filters')
 actions = ActionRegistry('aws.account.actions')
@@ -60,13 +51,17 @@ class Account(ResourceManager):
     action_registry = actions
     retry = staticmethod(QueryResourceManager.retry)
 
-    class resource_type(object):
+    class resource_type(TypeInfo):
         id = 'account_id'
         name = 'account_name'
         filter_name = None
         global_resource = True
         # fake this for doc gen
         service = "account"
+
+    @property
+    def source_type(self):
+        return 'describe'
 
     @classmethod
     def get_permissions(cls):
@@ -106,6 +101,49 @@ class AccountCredentialReport(CredentialReport):
         return results
 
 
+@filters.register('check-macie')
+class MacieEnabled(ValueFilter):
+    """Check status of macie v2 in the account.
+
+    Gets the macie session info for the account, and
+    the macie master account for the current account if
+    configured.
+    """
+
+    schema = type_schema('check-macie', rinherit=ValueFilter.schema)
+    schema_alias = False
+    annotation_key = 'c7n:macie'
+    annotate = False
+    permissions = ('macie2:GetMacieSession', 'macie2:GetMasterAccount',)
+
+    def process(self, resources, event=None):
+
+        if self.annotation_key not in resources[0]:
+            self.get_macie_info(resources[0])
+
+        if super().process([resources[0][self.annotation_key]]):
+            return resources
+
+    def get_macie_info(self, account):
+        client = local_session(
+            self.manager.session_factory).client('macie2')
+
+        try:
+            info = client.get_macie_session()
+            info.pop('ResponseMetadata')
+        except client.exceptions.AccessDeniedException:
+            info = {}
+
+        try:
+            minfo = client.get_master_account().get('master')
+        except (client.exceptions.AccessDeniedException,
+                client.exceptions.ResourceNotFoundException):
+            info['master'] = {}
+        else:
+            info['master'] = minfo
+        account[self.annotation_key] = info
+
+
 @filters.register('check-cloudtrail')
 class CloudTrailEnabled(Filter):
     """Verify cloud trail enabled for this account per specifications.
@@ -134,6 +172,8 @@ class CloudTrailEnabled(Filter):
         **{'multi-region': {'type': 'boolean'},
            'global-events': {'type': 'boolean'},
            'current-region': {'type': 'boolean'},
+           'in-home-region': {'type': 'boolean'},
+           'outside-home-region': {'type': 'boolean'},
            'running': {'type': 'boolean'},
            'notifies': {'type': 'boolean'},
            'file-digest': {'type': 'boolean'},
@@ -143,16 +183,25 @@ class CloudTrailEnabled(Filter):
     permissions = ('cloudtrail:DescribeTrails', 'cloudtrail:GetTrailStatus')
 
     def process(self, resources, event=None):
+        account = resources[0]
         session = local_session(self.manager.session_factory)
-        client = session.client('cloudtrail')
-        trails = client.describe_trails()['trailList']
-        resources[0]['c7n:cloudtrails'] = trails
+        if not 'c7n:cloudtrails' in account:
+            client = session.client('cloudtrail')
+            trails = client.describe_trails()['trailList']
+            account['c7n:cloudtrails'] = trails
+        trails = account['c7n:cloudtrails']
         if self.data.get('global-events'):
             trails = [t for t in trails if t.get('IncludeGlobalServiceEvents')]
         if self.data.get('current-region'):
             current_region = session.region_name
             trails = [t for t in trails if t.get(
                 'HomeRegion') == current_region or t.get('IsMultiRegionTrail')]
+        if self.data.get('in-home-region'):
+            current_region = session.region_name
+            trails  = [t for t in trails if t.get('HomeRegion') == current_region]
+        if self.data.get('outside-home-region'):
+            current_region = session.region_name
+            trails  = [t for t in trails if t.get('HomeRegion') != current_region]
         if self.data.get('kms'):
             trails = [t for t in trails if t.get('KmsKeyId')]
         if self.data.get('kms-key'):
@@ -303,6 +352,41 @@ class ConfigEnabled(Filter):
             return []
         return resources
 
+@filters.register('guard-duty')
+class GuardDuty(ValueFilter):
+    """Return annotated account resource if guard duty filter matches (on current rgion detector)
+
+    For example to determine if an account has guardduty enabled in the current region:
+
+    .. code-block:: yaml
+
+      policies:
+        - name: without-guardduty
+          resource: account
+          filters:
+            - type: guard-duty
+              key: Enabled
+              value: absent
+    """
+    schema = type_schema('guard-duty', rinherit=ValueFilter.schema)
+
+    permissions = ('guardduty:ListDetectors', 'guardduty:GetDetector')
+
+    def process(self, resources, event=None):
+        account = resources[0]
+        if not account.get('c7n:guard-duty'):
+            client = local_session(
+                self.manager.session_factory).client('guardduty')
+            detectors = client.list_detectors()['DetectorIds']
+            if len(detectors) > 0:
+                details = client.get_detector(DetectorId=detectors[0])
+                account['c7n:guard-duty'] = details
+            else:
+                account['c7n:guard-duty'] = None
+        if self.match(account['c7n:guard-duty']):
+            return resources
+        return []
+
 
 @filters.register('iam-summary')
 class IAMSummary(ValueFilter):
@@ -377,6 +461,45 @@ class IAMSummary(ValueFilter):
         return []
 
 
+@filters.register('access-analyzer')
+class AccessAnalyzer(ValueFilter):
+    """Check for access analyzers in an account
+
+    :example:
+
+    .. code-block:: yaml
+
+      policies:
+        - name: account-access-analyzer
+          resource: account
+          filters:
+            - type: access-analyzer
+              key: 'status'
+              value: ACTIVE
+              op: eq
+    """
+
+    schema = type_schema('access-analyzer', rinherit=ValueFilter.schema)
+    schema_alias = False
+    permissions = ('access-analyzer:ListAnalyzers',)
+    annotation_key = 'c7n:matched-analyzers'
+
+    def process(self, resources, event=None):
+        account = resources[0]
+        if not account.get(self.annotation_key):
+            client = local_session(self.manager.session_factory).client('accessanalyzer')
+            analyzers = self.manager.retry(client.list_analyzers)['analyzers']
+        else:
+            analyzers = account.get(self.annotation_key)
+
+        matched_analyzers = []
+        for analyzer in analyzers:
+            if self.match(analyzer):
+                matched_analyzers.append(analyzer)
+        account[self.annotation_key] = matched_analyzers
+        return matched_analyzers and resources or []
+
+
 @filters.register('password-policy')
 class AccountPasswordPolicy(ValueFilter):
     """Check an account's password policy.
@@ -425,6 +548,98 @@ class AccountPasswordPolicy(ValueFilter):
         return []
 
 
+@actions.register('set-password-policy')
+class SetAccountPasswordPolicy(BaseAction):
+    """Set an account's password policy.
+
+    This only changes the policy for the items provided.
+    If this is the first time setting a password policy and an item is not provided it will be
+    set to the defaults defined in the boto docs for IAM.Client.update_account_password_policy
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: set-account-password-policy
+                resource: account
+                filters:
+                  - not:
+                    - type: password-policy
+                      key: MinimumPasswordLength
+                      value: 10
+                      op: ge
+                actions:
+                    - type: set-password-policy
+                      policy:
+                        MinimumPasswordLength: 20
+    """
+    schema = type_schema(
+        'set-password-policy',
+        policy={
+            'type': 'object'
+        })
+    shape = 'UpdateAccountPasswordPolicyRequest'
+    service = 'iam'
+    permissions = ('iam:GetAccountPasswordPolicy', 'iam:UpdateAccountPasswordPolicy')
+
+    def validate(self):
+        return shape_validate(
+            self.data.get('policy', {}),
+            self.shape,
+            self.service)
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('iam')
+        account = resources[0]
+        if account.get('c7n:password_policy'):
+            config = account['c7n:password_policy']
+        else:
+            try:
+                config = client.get_account_password_policy().get('PasswordPolicy')
+            except client.exceptions.NoSuchEntityException:
+                config = {}
+        params = dict(self.data['policy'])
+        config.update(params)
+        config = {k: v for (k, v) in config.items() if k not in ('ExpirePasswords',
+            'PasswordPolicyConfigured')}
+        client.update_account_password_policy(**config)
+
+
+@filters.register('saml-providers')
+class SamlProvidersFilter(ValueFilter):
+    schema = type_schema('saml-providers', rinherit=ValueFilter.schema)
+    permissions = ('iam:ListSAMLProviders',)
+
+    def process(self, resources, event=None):
+        account = resources[0]
+        if not account.get('c7n:saml-providers'):
+            client = local_session(self.manager.session_factory).client('iam')
+            providers = client.list_saml_providers().get('SAMLProviderList')
+            account['c7n:saml-providers'] = providers
+        if self.match(account['c7n:saml-providers']):
+            return resources
+        else:
+            return []
+
+
+@filters.register('open-id-connect-providers')
+class OpenIdConnectProvidersFilter(ValueFilter):
+    schema = type_schema('open-id-connect-providers', rinherit=ValueFilter.schema)
+    permissions = ('iam:ListOpenIDConnectProviders',)
+
+    def process(self, resources, event=None):
+        account = resources[0]
+        if not account.get('c7n:open-id-connect-providers'):
+            client = local_session(self.manager.session_factory).client('iam')
+            providers = client.list_open_id_connect_providers().get('OpenIDConnectProviderList')
+            account['c7n:open-id-connect-providers'] = providers
+        if self.match(account['c7n:open-id-connect-providers']):
+            return resources
+        else:
+            return []
+
+
 @filters.register('service-limit')
 class ServiceLimit(Filter):
     """Check if account's service limits are past a given threshold.
@@ -432,44 +647,71 @@ class ServiceLimit(Filter):
     Supported limits are per trusted advisor, which is variable based
     on usage in the account and support level enabled on the account.
 
-      - service: AutoScaling limit: Auto Scaling groups
-      - service: AutoScaling limit: Launch configurations
-      - service: EBS limit: Active snapshots
-      - service: EBS limit: Active volumes
-      - service: EBS limit: General Purpose (SSD) volume storage (GiB)
-      - service: EBS limit: Magnetic volume storage (GiB)
-      - service: EBS limit: Provisioned IOPS
-      - service: EBS limit: Provisioned IOPS (SSD) storage (GiB)
-      - service: EC2 limit: Elastic IP addresses (EIPs)
+    The `names` attribute lets you filter which checks to query limits
+    about.  This is a case-insensitive globbing match on a check name.
+    You can specify a name exactly or use globbing wildcards like `VPC*`.
 
-      # Note this is extant for each active instance type in the account
-      # however the total value is against sum of all instance types.
-      # see issue https://github.com/cloud-custodian/cloud-custodian/issues/516
+    The names are exactly what's shown on the trusted advisor page:
 
-      - service: EC2 limit: On-Demand instances - m3.medium
+        https://console.aws.amazon.com/trustedadvisor/home#/category/service-limits
 
-      - service: EC2 limit: Reserved Instances - purchase limit (monthly)
-      - service: ELB limit: Active load balancers
-      - service: IAM limit: Groups
-      - service: IAM limit: Instance profiles
-      - service: IAM limit: Roles
-      - service: IAM limit: Server certificates
-      - service: IAM limit: Users
-      - service: RDS limit: DB instances
-      - service: RDS limit: DB parameter groups
-      - service: RDS limit: DB security groups
-      - service: RDS limit: DB snapshots per user
-      - service: RDS limit: Storage quota (GB)
-      - service: RDS limit: Internet gateways
-      - service: SES limit: Daily sending quota
-      - service: VPC limit: VPCs
-      - service: VPC limit: VPC Elastic IP addresses (EIPs)
+    or via the awscli:
+
+        aws --region us-east-1 support describe-trusted-advisor-checks --language en \
+            --query 'checks[?category==`service_limits`].[name]' --output text
+
+    While you can target individual checks via the `names` attribute, and
+    that should be the preferred method, the following are provided for
+    backward compatibility with the old style of checks:
+
+    - `services`
+
+        The resulting limit's `service` field must match one of these.
+        These are case-insensitive globbing matches.
+
+        Note: If you haven't specified any `names` to filter, then
+        these service names are used as a case-insensitive prefix match on
+        the check name.  This helps limit the number of API calls we need
+        to make.
+
+    - `limits`
+
+        The resulting limit's `Limit Name` field must match one of these.
+        These are case-insensitive globbing matches.
+
+    Some example names and their corresponding service and limit names:
+
+    Check Name                          Service         Limit Name
+    ----------------------------------  --------------  ---------------------------------
+    Auto Scaling Groups                 AutoScaling     Auto Scaling groups
+    Auto Scaling Launch Configurations  AutoScaling     Launch configurations
+    CloudFormation Stacks               CloudFormation  Stacks
+    ELB Application Load Balancers      ELB             Active Application Load Balancers
+    ELB Classic Load Balancers          ELB             Active load balancers
+    ELB Network Load Balancers          ELB             Active Network Load Balancers
+    VPC                                 VPC             VPCs
+    VPC Elastic IP Address              VPC             VPC Elastic IP addresses (EIPs)
+    VPC Internet Gateways               VPC             Internet gateways
+
+    Note: Some service limits checks are being migrated to service quotas,
+    which is expected to largely replace service limit checks in trusted
+    advisor.  In this case, some of these checks have no results.
 
     :example:
 
     .. code-block:: yaml
 
             policies:
+              - name: specific-account-service-limits
+                resource: account
+                filters:
+                  - type: service-limit
+                    names:
+                      - IAM Policies
+                      - IAM Roles
+                      - "VPC*"
+                    threshold: 1.0
+
               - name: increase-account-service-limits
                 resource: account
                 filters:
@@ -477,6 +719,7 @@ class ServiceLimit(Filter):
                     services:
                       - EC2
                     threshold: 1.0
+
               - name: specify-region-for-global-service
                 region: us-east-1
                 resource: account
@@ -493,20 +736,25 @@ class ServiceLimit(Filter):
         threshold={'type': 'number'},
         refresh_period={'type': 'integer',
                         'title': 'how long should a check result be considered fresh'},
+        names={'type': 'array', 'items': {'type': 'string'}},
         limits={'type': 'array', 'items': {'type': 'string'}},
         services={'type': 'array', 'items': {
-            'enum': ['EC2', 'ELB', 'VPC', 'AutoScaling',
-                     'RDS', 'EBS', 'SES', 'IAM']}})
+            'enum': ['AutoScaling', 'CloudFormation',
+                     'DynamoDB', 'EBS', 'EC2', 'ELB',
+                     'IAM', 'RDS', 'Route53', 'SES', 'VPC']}})
 
-    permissions = ('support:DescribeTrustedAdvisorCheckResult',)
-    check_id = 'eW7HH0l7J9'
+    permissions = ('support:DescribeTrustedAdvisorCheckRefreshStatuses',
+                   'support:DescribeTrustedAdvisorCheckResult',
+                   'support:DescribeTrustedAdvisorChecks',
+                   'support:RefreshTrustedAdvisorCheck')
+    deprecated_check_ids = ['eW7HH0l7J9']
     check_limit = ('region', 'service', 'check', 'limit', 'extant', 'color')
 
     # When doing a refresh, how long to wait for the check to become ready.
     # Max wait here is 5 * 10 ~ 50 seconds.
     poll_interval = 5
     poll_max_intervals = 10
-    global_services = set(['IAM'])
+    global_services = {'IAM'}
 
     def validate(self):
         region = self.manager.data.get('region', '')
@@ -535,44 +783,95 @@ class ServiceLimit(Filter):
                     break
         return checks
 
+    def get_available_checks(self, client, category='service_limits'):
+        checks = client.describe_trusted_advisor_checks(language='en')
+        return [c for c in checks['checks']
+                if c['category'] == category and
+                c['id'] not in self.deprecated_check_ids]
+
+    def match_patterns_to_value(self, patterns, value):
+        for p in patterns:
+            if fnmatch(value.lower(), p.lower()):
+                return True
+        return False
+
+    def should_process(self, name):
+        # if names specified, limit to these names
+        patterns = self.data.get('names')
+        if patterns:
+            return self.match_patterns_to_value(patterns, name)
+
+        # otherwise, if services specified, limit to those prefixes
+        services = self.data.get('services')
+        if services:
+            patterns = ["{}*".format(i) for i in services]
+            return self.match_patterns_to_value(patterns, name.replace(' ', ''))
+
+        return True
+
     def process(self, resources, event=None):
         client = local_session(self.manager.session_factory).client(
             'support', region_name='us-east-1')
-        checks = self.get_check_result(client, self.check_id)
 
-        region = self.manager.config.region
-        checks['flaggedResources'] = [r for r in checks['flaggedResources']
-            if r['metadata'][0] == region or (r['metadata'][0] == '-' and region == 'us-east-1')]
-        resources[0]['c7n:ServiceLimits'] = checks
-
-        delta = timedelta(self.data.get('refresh_period', 1))
-        check_date = parse_date(checks['timestamp'])
-        if datetime.now(tz=tzutc()) - delta > check_date:
-            client.refresh_trusted_advisor_check(checkId=self.check_id)
-        threshold = self.data.get('threshold')
-
-        services = self.data.get('services')
-        limits = self.data.get('limits')
+        checks = self.get_available_checks(client)
         exceeded = []
-
-        for resource in checks['flaggedResources']:
-            if threshold is None and resource['status'] == 'ok':
+        for check in checks:
+            if not self.should_process(check['name']):
                 continue
-            limit = dict(zip(self.check_limit, resource['metadata']))
-            if services and limit['service'] not in services:
-                continue
-            if limits and limit['check'] not in limits:
-                continue
-            limit['status'] = resource['status']
-            limit['percentage'] = float(limit['extant'] or 0) / float(
-                limit['limit']) * 100
-            if threshold and limit['percentage'] < threshold:
-                continue
-            exceeded.append(limit)
+            matched = self.process_check(client, check, resources, event)
+            if matched:
+                for m in matched:
+                    m['check_id'] = check['id']
+                    m['name'] = check['name']
+                exceeded.extend(matched)
         if exceeded:
             resources[0]['c7n:ServiceLimitsExceeded'] = exceeded
             return resources
         return []
+
+    def process_check(self, client, check, resources, event=None):
+        region = self.manager.config.region
+        results = self.get_check_result(client, check['id'])
+
+        # trim to only results for this region
+        results['flaggedResources'] = [
+            r
+            for r in results.get('flaggedResources', [])
+            if r['metadata'][0] == region or (r['metadata'][0] == '-' and region == 'us-east-1')
+        ]
+
+        # save all raw limit results to the account resource
+        if 'c7n:ServiceLimits' not in resources[0]:
+            resources[0]['c7n:ServiceLimits'] = []
+        resources[0]['c7n:ServiceLimits'].append(results)
+
+        # check if we need to refresh the check for next time
+        delta = datetime.timedelta(self.data.get('refresh_period', 1))
+        check_date = parse_date(results['timestamp'])
+        if datetime.datetime.now(tz=tzutc()) - delta > check_date:
+            client.refresh_trusted_advisor_check(checkId=check['id'])
+
+        services = self.data.get('services')
+        limits = self.data.get('limits')
+        threshold = self.data.get('threshold')
+        exceeded = []
+
+        for resource in results['flaggedResources']:
+            if threshold is None and resource['status'] == 'ok':
+                continue
+            limit = dict(zip(self.check_limit, resource['metadata']))
+            if services and not self.match_patterns_to_value(services, limit['service']):
+                continue
+            if limits and not self.match_patterns_to_value(limits, limit['check']):
+                continue
+            limit['status'] = resource['status']
+            limit['percentage'] = (
+                float(limit['extant'] or 0) / float(limit['limit']) * 100
+            )
+            if threshold and limit['percentage'] < threshold:
+                continue
+            exceeded.append(limit)
+        return exceeded
 
 
 @actions.register('request-limit-increase')
@@ -628,14 +927,17 @@ class RequestLimitIncrease(BaseAction):
 
     service_code_mapping = {
         'AutoScaling': 'auto-scaling',
-        'ELB': 'elastic-load-balancing',
+        'CloudFormation': 'aws-cloudformation',
+        'DynamoDB': 'amazon-dynamodb',
         'EBS': 'amazon-elastic-block-store',
         'EC2': 'amazon-elastic-compute-cloud-linux',
-        'RDS': 'amazon-relational-database-service-aurora',
-        'VPC': 'amazon-virtual-private-cloud',
+        'ELB': 'elastic-load-balancing',
         'IAM': 'aws-identity-and-access-management',
-        'CloudFormation': 'aws-cloudformation',
         'Kinesis': 'amazon-kinesis',
+        'RDS': 'amazon-relational-database-service-aurora',
+        'Route53': 'amazon-route53',
+        'SES': 'amazon-simple-email-service',
+        'VPC': 'amazon-virtual-private-cloud',
     }
 
     def process(self, resources):
@@ -841,7 +1143,6 @@ class EnableTrail(BaseAction):
                 update_args['Name'] = trail_name
                 client.update_trail(**update_args)
 
-
 @filters.register('has-virtual-mfa')
 class HasVirtualMFA(Filter):
     """Is the account configured with a virtual MFA device?
@@ -879,7 +1180,6 @@ class HasVirtualMFA(Filter):
 
     def process(self, resources, event=None):
         return list(filter(self.account_has_virtual_mfa, resources))
-
 
 @actions.register('enable-data-events')
 class EnableDataEvents(BaseAction):
@@ -1279,6 +1579,49 @@ class SetEbsEncryption(BaseAction):
                 KmsKeyId=self.data['key'])
 
 
+@filters.register('organization')
+class OrganizationDetails(ValueFilter):
+    """Return annotated account resource if the organization description matches.
+
+    For example, this can use used to filter to accounts with an organization.
+
+    Example iam summary wrt to matchable fields::
+
+      {
+        "xyz": 1
+      }
+
+    .. code-block:: yaml
+
+      policies:
+        - name: account-with-organization
+          resource: account
+          filters:
+            - type: organization
+              key: "."
+              value: present
+    """
+    schema = type_schema('organization', rinherit=ValueFilter.schema)
+    schema_alias = False
+    permissions = ('organizations:DescribeAccount',)
+
+    def process(self, resources, event=None):
+        account = resources[0]
+        if not account.get('c7n:organization'):
+            client = local_session(self.manager.session_factory).client('organizations')
+            try:
+                summary = client.describe_organization()['Organization']
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'AWSOrganizationsNotInUseException':
+                    summary = {}
+                else:
+                    raise
+            account['c7n:organization'] = summary
+        if self.match(account['c7n:organization']):
+            return resources
+        return []
+
+
 @filters.register('s3-public-block')
 class S3PublicBlock(ValueFilter):
     """Check for s3 public blocks on an account.
@@ -1350,7 +1693,7 @@ class SetS3PublicBlock(BaseAction):
         config.pop('type')
         if config.pop('state', None) is False and config:
             raise PolicyValidationError(
-                "%s cant set state false with controls specified".format(
+                "{} cant set state false with controls specified".format(
                     self.type))
 
     def process(self, resources):
@@ -1387,21 +1730,19 @@ class SetS3PublicBlock(BaseAction):
                 PublicAccessBlockConfiguration=config)
 
 
-@filters.register('glue-security-config')
-class GlueEncryptionEnabled(MultiAttrFilter):
-    """Filter aws account by its glue encryption status and KMS key """
+class GlueCatalogEncryptionEnabled(MultiAttrFilter):
+    """ Filter glue catalog by its glue encryption status and KMS key
 
-    """:example:
+    :example:
 
-    .. yaml:
+    .. code-block:: yaml
 
       policies:
-        - name: glue-security-config
-          resource: aws.account
+        - name: glue-catalog-security-config
+          resource: aws.glue-catalog
           filters:
             - type: glue-security-config
-                key: SseAwsKmsKeyId
-                value: alias/aws/glue
+              SseAwsKmsKeyId: alias/aws/glue
 
     """
     retry = staticmethod(QueryResourceManager.retry)
@@ -1411,7 +1752,7 @@ class GlueEncryptionEnabled(MultiAttrFilter):
         'additionalProperties': False,
         'properties': {
             'type': {'enum': ['glue-security-config']},
-            'CatalogEncryptionMode': {'type': 'string'},
+            'CatalogEncryptionMode': {'enum': ['DISABLED', 'SSE-KMS']},
             'SseAwsKmsKeyId': {'type': 'string'},
             'ReturnConnectionPasswordEncrypted': {'type': 'boolean'},
             'AwsKmsKeyId': {'type': 'string'}
@@ -1430,26 +1771,347 @@ class GlueEncryptionEnabled(MultiAttrFilter):
                        'AwsKmsKeyId']:
                 attrs.add(key)
         self.multi_attrs = attrs
-        return super(GlueEncryptionEnabled, self).validate()
+        return super(GlueCatalogEncryptionEnabled, self).validate()
 
     def get_target(self, resource):
         if self.annotation in resource:
             return resource[self.annotation]
         client = local_session(self.manager.session_factory).client('glue')
-        encryption_setting = client.get_data_catalog_encryption_settings().get(
-            'DataCatalogEncryptionSettings')
+        encryption_setting = resource.get('DataCatalogEncryptionSettings')
+        if self.manager.type != 'glue-catalog':
+            encryption_setting = client.get_data_catalog_encryption_settings().get(
+                'DataCatalogEncryptionSettings')
         resource[self.annotation] = encryption_setting.get('EncryptionAtRest')
         resource[self.annotation].update(encryption_setting.get('ConnectionPasswordEncryption'))
-
-        for kmskey in self.data:
-            if not self.data[kmskey].startswith('alias'):
+        key_attrs = ('SseAwsKmsKeyId', 'AwsKmsKeyId')
+        for encrypt_attr in key_attrs:
+            if encrypt_attr not in self.data or not self.data[encrypt_attr].startswith('alias'):
                 continue
-            key = resource[self.annotation].get(kmskey)
-            vfd = {'c7n:AliasName': self.data[kmskey]}
+            key = resource[self.annotation].get(encrypt_attr)
+            vfd = {'c7n:AliasName': self.data[encrypt_attr]}
             vf = KmsRelatedFilter(vfd, self.manager)
             vf.RelatedIdsExpression = 'KmsKeyId'
             vf.annotate = False
             if not vf.process([{'KmsKeyId': key}]):
                 return []
-            resource[self.annotation][kmskey] = self.data[kmskey]
+            resource[self.annotation][encrypt_attr] = self.data[encrypt_attr]
         return resource[self.annotation]
+
+
+@filters.register('glue-security-config')
+class AccountCatalogEncryptionFilter(GlueCatalogEncryptionEnabled):
+    """Filter aws account by its glue encryption status and KMS key
+
+    :example:
+
+    .. code-block:: yaml
+
+      policies:
+        - name: glue-security-config
+          resource: aws.account
+          filters:
+            - type: glue-security-config
+              SseAwsKmsKeyId: alias/aws/glue
+
+    """
+
+
+@filters.register('emr-block-public-access')
+class EMRBlockPublicAccessConfiguration(ValueFilter):
+    """Check for EMR block public access configuration on an account
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: get-emr-block-public-access
+                resource: account
+                filters:
+                  - type: emr-block-public-access
+    """
+
+    annotation_key = 'c7n:emr-block-public-access'
+    annotate = False  # no annotation from value filter
+    schema = type_schema('emr-block-public-access', rinherit=ValueFilter.schema)
+    schema_alias = False
+    permissions = ("elasticmapreduce:GetBlockPublicAccessConfiguration",)
+
+    def process(self, resources, event=None):
+        self.augment([r for r in resources if self.annotation_key not in r])
+        return super().process(resources, event)
+
+    def augment(self, resources):
+        client = local_session(self.manager.session_factory).client(
+            'emr', region_name=self.manager.config.region)
+
+        for r in resources:
+            try:
+                r[self.annotation_key] = client.get_block_public_access_configuration()
+                r[self.annotation_key].pop('ResponseMetadata')
+            except client.exceptions.NoSuchPublicAccessBlockConfiguration:
+                r[self.annotation_key] = {}
+
+    def __call__(self, r):
+        return super(EMRBlockPublicAccessConfiguration, self).__call__(r[self.annotation_key])
+
+
+@actions.register('set-emr-block-public-access')
+class PutAccountBlockPublicAccessConfiguration(BaseAction):
+    """Action to put/update the EMR block public access configuration for your
+       AWS account in the current region
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: set-emr-block-public-access
+                resource: account
+                filters:
+                  - type: emr-block-public-access
+                    key: BlockPublicAccessConfiguration.BlockPublicSecurityGroupRules
+                    value: False
+                actions:
+                  - type: set-emr-block-public-access
+                    config:
+                        BlockPublicSecurityGroupRules: True
+                        PermittedPublicSecurityGroupRuleRanges:
+                            - MinRange: 22
+                              MaxRange: 22
+                            - MinRange: 23
+                              MaxRange: 23
+
+    """
+
+    schema = type_schema('set-emr-block-public-access',
+                         config={"type": "object",
+                            'properties': {
+                                'BlockPublicSecurityGroupRules': {'type': 'boolean'},
+                                'PermittedPublicSecurityGroupRuleRanges': {
+                                    'type': 'array',
+                                    'items': {
+                                        'type': 'object',
+                                        'properties': {
+                                            'MinRange': {'type': 'number', "minimum": 0},
+                                            'MaxRange': {'type': 'number', "minimum": 0}
+                                        },
+                                        'required': ['MinRange']
+                                    }
+                                }
+                            },
+                             'required': ['BlockPublicSecurityGroupRules']
+                         },
+                         required=('config',))
+
+    permissions = ("elasticmapreduce:PutBlockPublicAccessConfiguration",)
+
+    def process(self, resources):
+        client = local_session(self.manager.session_factory).client('emr')
+        r = resources[0]
+
+        base = {}
+        if EMRBlockPublicAccessConfiguration.annotation_key in r:
+            base = r[EMRBlockPublicAccessConfiguration.annotation_key]
+        else:
+            try:
+                base = client.get_block_public_access_configuration()
+                base.pop('ResponseMetadata')
+            except client.exceptions.NoSuchPublicAccessBlockConfiguration:
+                base = {}
+
+        config = base['BlockPublicAccessConfiguration']
+        updatedConfig = {**config, **self.data.get('config')}
+
+        if config == updatedConfig:
+            return
+
+        client.put_block_public_access_configuration(
+            BlockPublicAccessConfiguration=updatedConfig
+        )
+
+
+@filters.register('securityhub')
+class SecHubEnabled(Filter):
+    """Filter an account depending on whether security hub is enabled or not.
+
+    :example:
+
+    .. code-block:: yaml
+
+       policies:
+         - name: check-securityhub-status
+           resource: aws.account
+           filters:
+            - type: securityhub
+              enabled: true
+
+    """
+
+    permissions = ('securityhub:DescribeHub',)
+
+    schema = type_schema('securityhub', enabled={'type': 'boolean'})
+
+    def process(self, resources, event=None):
+        state = self.data.get('enabled', True)
+        client = local_session(self.manager.session_factory).client('securityhub')
+        sechub = self.manager.retry(client.describe_hub, ignore_err_codes=(
+            'InvalidAccessException',))
+        if state == bool(sechub):
+            return resources
+        return []
+
+@filters.register('alarmed-cloudtrail-patterns')
+class MonitoredCloudtrailMetric(Filter):
+    """Finds cloudtrails with logging and a metric filter. Is a subclass of ValueFilter,
+    filtering the metric filter objects. Optionally, verifies an alarm exists (true by default),
+    and for said alarm, there is atleast one SNS subscription (again, true by default).
+    :example:
+        .. code-block: yaml
+            policies:
+              - name: cloudtrail-trail-with-login-attempts
+                resource: cloudtrail
+                region: us-east-1
+                filters:
+                  - type: monitored-metric
+                    alarm: true
+                    topic-subscription: false
+                    filter: '$.eventName = DeleteTrail'
+    """
+
+    schema = type_schema('alarmed-cloudtrail-patterns', **{
+        'patterns': {'type': 'array'},
+        'topic-subscription': {'type': 'boolean'},
+        'alarm': {'type': 'boolean'},
+        'ignore-cross-account-authorization': {'type': 'boolean'}
+    })
+
+    permissions = ('logs:DescribeMetricFilters', 'cloudwatch:DescribeAlarms',
+        'sns:ListSubscriptionsByTopic')
+
+    def find_subscribed_topic_arns(self, session, topicArns, region):
+        sns = session.client('sns', region_name=region)
+        def arn_has_subscriptions(arn):
+            self.log.info("Checking subscriptions for %s" % arn)
+            try:
+                subscriptions = sns.list_subscriptions_by_topic(TopicArn=arn)['Subscriptions']
+                return any(subscriptions)
+            except sns.exceptions.NotFoundException:
+                self.log.info("ARN %s was not found in list_subscriptions_by_topic" % arn)
+                return False
+
+        return list(filter(arn_has_subscriptions, topicArns))
+
+    def all_alarms(self, session, region):
+        client = session.client('cloudwatch', region_name=region)
+        paginator = client.get_paginator('describe_alarms')
+        try:
+            self.log.info("Listing all alarms in region %s" % region)
+            results = paginator.paginate().build_full_result()
+            return results['MetricAlarms']
+        except ClientError as e:
+            self.log.info("Error getting list of all alarms: %s" % e.response['Error']['Code'])
+            if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                return []
+            else:
+                raise
+
+    def fetch_metric_filters_for_log_group(self, session, groupName, region):
+        logs = session.client('logs', region_name=region)
+        paginator = logs.get_paginator('describe_metric_filters')
+        try:
+            results = paginator.paginate(logGroupName=groupName).build_full_result()
+            return results['metricFilters']
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                return []
+            else:
+                raise
+
+    def alarm_contains_metrics(self, alarm, metrics):
+        if 'Namespace' not in alarm or 'MetricName' not in alarm:
+            self.log.info("No namespace / metric associated with alarm")
+            return False
+        pair = (alarm['Namespace'], alarm['MetricName'])
+        return pair in metrics
+
+    def account_matches_filters(self, account):
+        trails = self.manager.get_resource_manager('cloudtrail').resources()
+        self.log.info("Checkin account again %d trails" % len(trails))
+        return any(list(filter(self.cloudtrail_matches_filter, trails)))
+
+    def text_matches_patterns(self, metric_filter):
+        patterns = self.data['patterns']
+        if 'filterPattern' not in metric_filter:
+            self.log.info("No pattern match defined")
+            return False
+        text = metric_filter['filterPattern']
+        return all(list(map(lambda pattern: bool(re.search(pattern, text, flags=re.IGNORECASE)), patterns)))
+
+    def cloudtrail_matches_filter(self, trail):
+        self.log.info("Checking trail with arn = %s" % trail['TrailARN'])
+        logGroupArn = trail.get('CloudWatchLogsLogGroupArn')
+        if not logGroupArn:
+            self.log.info("No cloudwatch log group associated with trail")
+            return False
+        groupName = re.search(':log-group:([^:]+)', logGroupArn).group(1)
+        # When we have a shadow group, we need to process the given region instead of the base.
+        groupRegion = re.search('arn:aws:logs:([^:]+):', logGroupArn).group(1)
+
+        self.log.info("extracted name = %s, region = %s from arn %s" %(groupName, groupRegion, logGroupArn))
+
+        session = local_session(self.manager.session_factory)
+
+        filters = self.fetch_metric_filters_for_log_group(session, groupName, groupRegion)
+        matchingFilters = list(filter(self.text_matches_patterns, filters))
+        if not matchingFilters:
+            self.log.info("None of the found filters match a pattern")
+            return False
+
+        # We need to filter the list of transformations to those that emit a value, and then put
+        # it into a format we can easily cross compare on.
+        allTransformations = list(map(lambda filter: filter['metricTransformations'], matchingFilters))
+        transformations = sum(allTransformations, [])
+        emittedMetrics = list(map(lambda t: (t['metricNamespace'], t['metricName']), transformations))
+        if not emittedMetrics:
+            self.log.info("No emitted metrics found from the available metric transformations")
+            return False
+
+        consideredSet = emittedMetrics
+
+        if self.data.get('alarm', True):
+            metricAlarms = self.all_alarms(session, groupRegion)
+
+            def alarmFilter(alarm):
+                return self.alarm_contains_metrics(alarm, emittedMetrics)
+            filteredAlarms = list(filter(alarmFilter, metricAlarms))
+            if not filteredAlarms:
+                self.log.info("Non alarms in the account region match the defined metrics")
+                return False
+            consideredSet = filteredAlarms
+            if self.data.get('topic-subscription'):
+                ignore_cross_account = self.data.get('ignore-cross-account-authorization', False)
+                alarmSNSTopics = sum(list(map(lambda alarm: alarm['AlarmActions'], filteredAlarms)), [])
+                if not alarmSNSTopics:
+                    self.log.info("No matching SNS topics in alarm actions")
+                    return False
+                try:
+                    consideredSet = self.find_subscribed_topic_arns(session, alarmSNSTopics, groupRegion)
+                except ClientError as e:
+                    consideredSet = []
+                    # It's a common practice to have a SNS topic in a seperate account that this listens
+                    # to, and hence this
+                    if e.response['Error']['Code'] == 'AuthorizationError':
+                        self.log.info("Cross account authorization error")
+                        topicAccountIDs = list(map(lambda x: x.split(":")[4], alarmSNSTopics))
+                        currentAccountIDs = list(map(lambda alarm: alarm['AlarmArn'].split(":")[4], filteredAlarms))
+                        otherAccountIDs = [accountID for accountID in topicAccountIDs if accountID not in currentAccountIDs]
+                        if ignore_cross_account and any(topicAccountIDs):
+                            # IF we have any accounts, and we can ignore the cross account set,
+                            # set the list to other accounts as respective.
+                            consideredSet = otherAccountIDs
+
+        return any(consideredSet)
+
+    def process(self, resources, event=None):
+        return list(filter(self.account_matches_filters, resources))
