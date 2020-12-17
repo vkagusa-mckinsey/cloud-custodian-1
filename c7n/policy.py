@@ -31,7 +31,7 @@ def load(options, path, format=None, validate=True, vars=None):
     if not os.path.exists(path):
         raise IOError("Invalid path for config %r" % path)
 
-    from c7n.schema import validate, StructureParser
+    from c7n.schema import StructureParser, validate as validate_schema
     data = utils.load_file(path, format=format, vars=vars)
 
     structure = StructureParser()
@@ -43,7 +43,7 @@ def load(options, path, format=None, validate=True, vars=None):
         return None
 
     if validate:
-        errors = validate(data)
+        errors = validate_schema(data)
         if errors:
             raise PolicyValidationError(
                 "Failed to validate policy %s \n %s" % (
