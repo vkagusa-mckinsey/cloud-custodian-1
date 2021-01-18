@@ -62,6 +62,29 @@ class ElasticSearchDomain(QueryResourceManager):
         'config': ConfigSource
     }
 
+@ElasticSearchDomain.filter_registry.register('cross-account')
+class ElasticSearchCrossAccountAccessFilter(CrossAccountAccessFilter):
+    """Filters elastic search domains with cross-account permissions
+
+    The whitelist parameter can be used to prevent certain accounts
+    from being included in the results (essentially stating that these
+    accounts permissions are allowed to exist)
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: es-cross-account
+                resource: elasticsearch
+                filters:
+                  - type: cross-account
+                    whitelist:
+                      - 'IAM-Policy-Cross-Account-Access'
+
+    """
+
+    policy_attribute = 'AccessPolicies'
 
 ElasticSearchDomain.filter_registry.register('marked-for-op', TagActionFilter)
 

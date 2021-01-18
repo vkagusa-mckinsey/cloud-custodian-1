@@ -1,5 +1,7 @@
 # Copyright The Cloud Custodian Authors.
 # SPDX-License-Identifier: Apache-2.0
+
+from botocore.exceptions import ClientError, EndpointConnectionError
 from collections import Counter, defaultdict
 from datetime import timedelta, datetime
 from functools import wraps
@@ -8,7 +10,7 @@ import itertools
 import logging
 import os
 import sys
-
+import beeline
 import yaml
 from yaml.constructor import ConstructorError
 
@@ -18,10 +20,13 @@ from c7n.policy import Policy, PolicyCollection, load as policy_load
 from c7n.schema import ElementSchema, StructureParser, generate
 from c7n.utils import load_file, local_session, SafeLoader, yaml_dump
 from c7n.config import Bag, Config
+from c7n.credentials import UnableToAssumeRole
+from c7n import provider
 from c7n.resources import (
     load_resources, load_available, load_providers, PROVIDER_NAMES)
 
-
+from c7n.beeline_tracing import traceable
+from c7n import error_tracking
 log = logging.getLogger('custodian.commands')
 
 
@@ -252,7 +257,11 @@ def validate(options):
         sys.exit(1)
 
 
+AWS_ERROR_BLACKLIST = ['OptInRequired', 'SubscriptionRequiredException', 'EndpointConnectionError']
+AWS_EXPIRED_REQUESTS = ['RequestExpired', 'ExpiredToken', 'ExpiredTokenException', 'InvalidClientTokenId', 'AuthFailure']
+
 @policy_command
+@traceable(name='c7n-run')
 def run(options, policies):
     exit_code = 0
 
@@ -267,19 +276,58 @@ def run(options, policies):
 
     errored_policies = []
     for policy in policies:
-        try:
-            policy()
-        except Exception:
-            exit_code = 2
-            errored_policies.append(policy.name)
-            if options.debug:
-                raise
-            log.exception(
-                "Error while executing policy %s, continuing" % (
-                    policy.name))
-    if exit_code != 0:
+        def invoke_policy(attempt=0, retry_limit=3):
+            with beeline.tracer(name="outer-policy"):
+                try:
+                    policy()
+                except UnableToAssumeRole:
+                    log.warning("Unable to assume the especified role.")
+                except EndpointConnectionError:
+                    log.warning("Unable to find the correct endpoint - this usually means a new server.")
+                except ClientError as e:
+                    # AWS Client error, we can handle + resume this, in theory - but we should log
+                    # it as a warning to the error tracker with some context.
+                    error_body = e.response['Error']
+                    error_code = error_body.get('Code', 'Unknown')
+                    if error_code in ['AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation', 'AuthorizationError']:
+                        log.warning("Reported access denied exception in %s, continuing: %s" % (policy.name, repr({
+                            'error_details': error_body,
+                            'policy': repr(policy),
+                            'policy_data': policy.data,
+                            'policy_options': policy.options,
+                            'expected_permissions': list(policy.get_permissions()),
+                        })))
+                    elif error_code in AWS_ERROR_BLACKLIST:
+                        # DO nothing... We don't report these.
+                        log.warning("Got error on blacklist: %s" % (error_code,))
+                    elif error_code in AWS_EXPIRED_REQUESTS or (error_code == 'AuthFailure' and 'The security token included in the request is invalid' in error_body):
+                        log.warning("Error with expired credentials, we'll want to force a refresh?")
+
+                        attempts = attempt + 1
+                        if attempts > retry_limit:
+                            raise
+                        else:
+                            invoke_policy(attempt=attempts)
+                    else:
+                        # Handle it here, but we skip.
+                        error_tracking.report_exception()
+                        log.warning("Reported generic client exception in %s as %s, continuing." % (policy.name, error_code))
+                except Exception:
+                    exit_code = 2
+                    error_tracking.report_exception()
+                    if options.debug:
+                        raise
+                    log.exception(
+                        "Error in policy: %s" % (
+                            policy.name))
+        invoke_policy()
+    if exit_code == 0:
+        log.info("Successfully ran %d policies." % len(policies))
+    else:
+        log.info("Ran %d policies, encountered an unhandled exception." % len(policies))
         log.error("The following policies had errors while executing\n - %s" % (
             "\n - ".join(errored_policies)))
+        beeline.close()
         sys.exit(exit_code)
 
 

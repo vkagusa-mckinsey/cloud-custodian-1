@@ -33,6 +33,37 @@ class Alarm(QueryResourceManager):
     retry = staticmethod(get_retry(('Throttled',)))
 
 
+@Alarm.filter_registry.register('missing-metric')
+class MissingMetricFilter(Filter):
+
+    schema = type_schema('missing-metric', days={'type': 'number'})
+    permissions = ('cloudwatch:GetMetricStatistics',)
+
+    def process(self, resources, event=None):
+        cache = {}
+        client = local_session(self.manager.session_factory).client('cloudwatch')
+        return [r for r in resources if self.metric_is_missing(r, cache, client)]
+
+    def metric_is_missing(self, resource, cache, client):
+        days = self.data.get('days', 14)
+        duration = timedelta(days)
+        now = datetime.utcnow()
+
+        if ('Namespace' not in resource) or ('MetricName' not in resource):
+            return True
+
+        statistics = client.get_metric_statistics(
+            Statistics=['SampleCount'],
+            StartTime=(now - duration),
+            EndTime=now,
+            Period=int(duration.total_seconds()),
+            Namespace=resource['Namespace'],
+            MetricName=resource['MetricName'],
+            Dimensions=resource['Dimensions'])['Datapoints']
+
+        return len(statistics) == 0
+
+
 @Alarm.action_registry.register('delete')
 class AlarmDelete(BaseAction):
     """Delete a cloudwatch alarm.
@@ -385,6 +416,48 @@ class LastWriteDays(Filter):
         last_write = parse_date(last_timestamp)
         group['lastWrite'] = last_write
         return self.date_threshold > last_write
+
+@LogGroup.filter_registry.register('for-lambda')
+class AssociatedLambdaFilter(Filter):
+    """Filters CloudWatch log groups to have an associated
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: cloudwatch-groups-with-lambda
+                resource: log-group
+                filters:
+                  - type: for-lambda
+    """
+
+    schema = type_schema('for-lambda')
+
+    def process(self, resources, event=None):
+        regional_lambda_names = {}
+
+        def fetch_region_names(region):
+            if not region in regional_lambda_names:
+                client = self.manager.session_factory(region=region).client('lambda')
+                names = [function['FunctionName'] for function in client.list_functions()['Functions']]
+                regional_lambda_names[region] = names
+            return regional_lambda_names[region]
+        this_region = fetch_region_names(self.manager.config.region)
+
+        def matches(resource):
+            name = resource['logGroupName']
+            if not name.startswith('/aws/lambda/'):
+                return False
+            function = name.split("/")[3]
+            function_names = []
+            if "." in function:
+                region, function = function.split(".")
+                function_names = fetch_region_names(region)
+            else:
+                function_names = this_region
+            return function in function_names
+        return list(filter(matches, resources))
 
 
 @LogGroup.filter_registry.register('cross-account')

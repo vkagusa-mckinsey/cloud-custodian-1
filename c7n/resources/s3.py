@@ -974,6 +974,39 @@ class MissingPolicyStatementFilter(Filter):
             return False
         return True
 
+@filters.register('policy-value')
+class PolicyValue(ValueFilter):
+    """Find buckets who match a given value for their policy
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-bucket-with-cloudtrail
+                resource: s3
+                filters:
+                  - type: policy-value
+                    key:
+                    value:
+    """
+
+    schema = type_schema('policy-value', rinherit=ValueFilter.schema)
+    permissions = ('s3:GetBucketPolicy',)
+
+    def process(self, resources, event=None):
+        matches = []
+        for item in resources:
+            policy = item.get('Policy', None)
+            if policy is None:
+                continue
+            if 'c7n:ParsedPolicy' not in item:
+                parsedPolicy = json.loads(policy)
+                item['c7n:ParsedPolicy'] = parsedPolicy
+            if self.match(item['c7n:ParsedPolicy']):
+                matches.append(item)
+        return matches
+
 
 @filters.register('bucket-notification')
 class BucketNotificationFilter(ValueFilter):
@@ -2600,7 +2633,10 @@ class RemoveBucketTag(RemoveTag):
 @filters.register('data-events')
 class DataEvents(Filter):
 
-    schema = type_schema('data-events', state={'enum': ['present', 'absent']})
+    schema = type_schema(
+      'data-events',
+      state={'enum': ['present', 'absent']},
+      event_type={'enum': ['WriteOnly', 'ReadOnly', 'All']})
     permissions = (
         'cloudtrail:DescribeTrails',
         'cloudtrail:GetEventSelectors')
@@ -2617,15 +2653,29 @@ class DataEvents(Filter):
 
         event_buckets = {}
         for t in trails:
-            for events in clients[t.get('HomeRegion')].get_event_selectors(
-                    TrailName=t['Name']).get('EventSelectors', ()):
+          try:
+            event_response = clients[t.get('HomeRegion')].get_event_selectors(
+                    TrailName=t['Name'])
+            event_selectors = event_response.get('EventSelectors', ())
+            event_type = self.data['event_type']
+            for events in event_selectors:
                 if 'DataResources' not in events:
                     continue
+                read_write_type = events['ReadWriteType']
+                matches_read = event_type == 'ReadOnly' and read_write_type != 'WriteOnly'
+                matches_write = event_type == 'WriteOnly' and read_write_type != 'ReadOnly'
                 for data_events in events['DataResources']:
                     if data_events['Type'] != 'AWS::S3::Object':
                         continue
                     for b in data_events['Values']:
-                        event_buckets[b.rsplit(':')[-1].strip('/')] = t['Name']
+                        if read_write_type == 'All' or matches_read or matches_write:
+                          bucket_name = b.rsplit(':')[-1].strip('/')
+                          if bucket_name == 's3':
+                            bucket_name = 'all'
+                          event_buckets[bucket_name] = t['Name']
+          except ClientError as e:
+            if e.response['Error']['Code'] != 'TrailNotFoundException':
+                raise
         return event_buckets
 
     def process(self, resources, event=None):
@@ -2634,9 +2684,9 @@ class DataEvents(Filter):
         event_buckets = self.get_event_buckets(session, trails)
         ops = {
             'present': lambda x: (
-                x['Name'] in event_buckets or '' in event_buckets),
+                x['Name'] in event_buckets or 'all' in event_buckets),
             'absent': (
-                lambda x: x['Name'] not in event_buckets and ''
+                lambda x: x['Name'] not in event_buckets and 'all'
                 not in event_buckets)}
 
         op = ops[self.data['state']]

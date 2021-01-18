@@ -39,7 +39,7 @@ import jmespath
 import re
 from decimal import Decimal as D, ROUND_HALF_UP
 
-from distutils.version import LooseVersion
+from c7n.filters.core import ComparableVersion
 from botocore.exceptions import ClientError
 from concurrent.futures import as_completed
 
@@ -216,6 +216,8 @@ def _get_available_engine_upgrades(client, major=False):
     results = {}
     paginator = client.get_paginator('describe_db_engine_versions')
     for page in paginator.paginate():
+        # DBEngineVersions is an ordered list, based on all data seen so far.
+        # it is not explicitly called out as such.
         engine_versions = page['DBEngineVersions']
         for v in engine_versions:
             if not v['Engine'] in results:
@@ -225,9 +227,10 @@ def _get_available_engine_upgrades(client, major=False):
             for t in v['ValidUpgradeTarget']:
                 if not major and t['IsMajorVersionUpgrade']:
                     continue
-                if LooseVersion(t['EngineVersion']) > LooseVersion(
-                        results[v['Engine']].get(v['EngineVersion'], '0.0.0')):
-                    results[v['Engine']][v['EngineVersion']] = t['EngineVersion']
+                target_version = t['EngineVersion']
+                latest_version = results[v['Engine']].get(v['EngineVersion'], '0.0.0')
+                if ComparableVersion(target_version) > ComparableVersion(latest_version):
+                    results[v['Engine']][v['EngineVersion']] = target_version
     return results
 
 
@@ -370,7 +373,85 @@ class UpgradeAvailable(Filter):
                     results.append(r)
                 continue
             r['c7n-rds-engine-upgrade'] = target_upgrade
+
+            if 'c7n:rds-version-targets' not in r:
+                r['c7n:rds-version-targets'] = {}
+            version_key = 'major' if check_major else 'minor'
+            r['c7n:rds-version-targets'][version_key] = target_upgrade
+
             results.append(r)
+        return results
+
+
+@filters.register('public-subnet')
+class PublicSubnet(Filter):
+    """ Scan DB instances for those in public subnets.
+
+    Checks for RDS instances in subnets that are publicly routable.
+
+    Based on https://github.com/awslabs/aws-config-rules/blob/master/python/rds_vpc_public_subnet.py
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: rds-with-public-subnet
+                resource: rds
+                filters:
+                  - type: public-subnet
+
+    """
+
+    schema = type_schema('public-subnet',
+                         major={'type': 'boolean'},
+                         value={'type': 'boolean'})
+    permissions = ('ec2:DescribeRouteTables',)
+
+    def process(self, resources, event=None):
+        route_tables = self.manager.get_resource_manager('route-table').resources()
+        results = []
+        for instance in resources:
+            vpc_id = instance['DBSubnetGroup']['VpcId']
+            subnet_ids = [s['SubnetIdentifier'] for s in instance['DBSubnetGroup']['Subnets']]
+
+            private = True
+
+            def public_route(route):
+                public_destination = 'DestinationCidrBlock' in route and route['DestinationCidrBlock'] == '0.0.0.0/0'
+                has_igw = 'GatewayId' in route and route['GatewayId'].startswith('igw-')
+                return public_destination or has_igw
+
+            for subnet_id in subnet_ids:
+                main_table_is_public = False
+                no_explicit_association = True
+                explicit_association_is_public = False
+
+                relevant_tables = [rt for rt in route_tables if rt['VpcId'] == vpc_id]
+                for route_table in relevant_tables:
+                    for association in route_table['Associations']:
+                        if association['Main'] == True:
+                            for route in route_table['Routes']:
+                                if public_route(route):
+                                    main_table_is_public = True
+                        elif association['SubnetId'] == subnet_id:
+                            no_explicit_association = False
+                            for route in route_table['Routes']:
+                                if public_route(route):
+                                    explicit_association_is_public = True
+
+            if (main_table_is_public and no_explicit_association) or explicit_association_is_public:
+                private = False
+
+            instance['c7n:PublicSubnet'] = {
+                'Private': private,
+                'MainTableIsPublic': main_table_is_public,
+                'NoExplicitAssociation': no_explicit_association,
+                'ExplicitAssociationIsPublic': explicit_association_is_public
+            }
+
+            if not private:
+                results.append(instance)
         return results
 
 

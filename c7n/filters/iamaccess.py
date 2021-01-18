@@ -37,7 +37,7 @@ log = logging.getLogger('custodian.iamaccess')
 def _account(arn):
     # we could try except but some minor runtime cost, basically flag
     # invalids values
-    if ':' not in arn:
+    if 'arn:' not in arn:
         return arn
     return arn.split(':', 5)[4]
 
@@ -86,7 +86,11 @@ class PolicyChecker:
     # Policy statement handling
     def check(self, policy_text):
         if isinstance(policy_text, str):
-            policy = json.loads(policy_text)
+            try:
+                policy = json.loads(policy_text)
+            except ValueError:
+                log.error("Error loading policy from string: %s " % repr(policy_text))
+                return []
         else:
             policy = policy_text
 

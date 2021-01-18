@@ -7,6 +7,7 @@ import random
 import re
 import zlib
 
+import jmespath
 from botocore.exceptions import ClientError
 from dateutil.parser import parse
 from concurrent.futures import as_completed
@@ -22,6 +23,7 @@ from c7n.filters import (
 )
 from c7n.filters.offhours import OffHour, OnHour
 import c7n.filters.vpc as net_filters
+from c7n.filters.iam import ActionEffectFilter
 
 from c7n.manager import resources
 from c7n import query, utils
@@ -194,6 +196,19 @@ class ComputePermissions(CheckPermissions):
             profile_role_map.get(r.get('IamInstanceProfile', {}).get('Arn'))
             for r in resources]
 
+@filters.register('instance-profile-action-effect')
+class Ec2InstanceProfileActionEffectFilter(ActionEffectFilter):
+    profile_arn_selector = jmespath.compile("IamInstanceProfile.Arn")
+    schema = type_schema('instance-profile-action-effect', rinherit=ActionEffectFilter.schema)
+
+    def statements_for_resource(self, resource, manager):
+        instance_profile_arn = self.profile_arn_selector.search(resource)
+
+        if instance_profile_arn:
+            name = instance_profile_arn.split(":instance-profile/")[1]
+            return manager.for_instance_profile(name)
+        else:
+            return manager.for_instance_profile(None)
 
 @filters.register('state-age')
 class StateTransitionAge(AgeFilter):
