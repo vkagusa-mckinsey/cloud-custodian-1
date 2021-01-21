@@ -1402,7 +1402,7 @@ class FilterPublicBlock(Filter):
         IgnorePublicAcls={'type': 'boolean'},
         BlockPublicPolicy={'type': 'boolean'},
         RestrictPublicBuckets={'type': 'boolean'})
-    permissions = ("s3:GetBucketPublicAccessBlock",)
+    permissions = ("s3:GetBucketPublicAccessBlock", "s3control:GetPublicAccessBlock")
     keys = (
         'BlockPublicPolicy', 'BlockPublicAcls', 'IgnorePublicAcls', 'RestrictPublicBuckets')
     annotation_key = 'c7n:PublicAccessBlock'
@@ -1416,6 +1416,24 @@ class FilterPublicBlock(Filter):
                     results.append(futures[f])
         return results
 
+    def account_level_configuration(self):
+        configuration = self.manager._cache.get('account-public-access-block-configuration')
+        if configuration:
+            return configuration
+
+        configuration = {}
+        session = local_session(self.manager.session_factory)
+        s3control = session.client('s3control')
+
+        try:
+            configuration = s3control.get_public_access_block(AccountId=self.manager.config.account_id)['PublicAccessBlockConfiguration']
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'NoSuchPublicAccessBlockConfiguration':
+                raise
+
+        self.manager._cache.save('account-public-access-block-configuration', configuration)
+        return configuration
+
     def process_bucket(self, bucket):
         s3 = bucket_client(local_session(self.manager.session_factory), bucket)
         config = dict(bucket.get(self.annotation_key, {key: False for key in self.keys}))
@@ -1426,7 +1444,15 @@ class FilterPublicBlock(Filter):
             except ClientError as e:
                 if e.response['Error']['Code'] != 'NoSuchPublicAccessBlockConfiguration':
                     raise
+
+            account_config = self.account_level_configuration()
+            for (k, v)  in account_config.items():
+                if v:
+                    config[k] = True
+
             bucket[self.annotation_key] = config
+
+
         return self.matches_filter(config)
 
     def matches_filter(self, config):
