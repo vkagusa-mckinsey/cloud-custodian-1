@@ -921,12 +921,6 @@ class RoleCrossAccountAccess(CrossAccountAccessFilter):
     policy_attribute = 'AssumeRolePolicyDocument'
     permissions = ('iam:ListRoles',)
 
-    schema = type_schema(
-        'cross-account',
-        # white list accounts
-        whitelist_from=ValuesFrom.schema,
-        whitelist={'type': 'array', 'items': {'type': 'string'}})
-
 
 @Role.filter_registry.register('has-inline-policy')
 class IamRoleInlinePolicy(Filter):
