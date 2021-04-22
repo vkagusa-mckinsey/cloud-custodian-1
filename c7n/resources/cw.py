@@ -440,7 +440,11 @@ class AssociatedLambdaFilter(Filter):
         def fetch_region_names(region):
             if not region in regional_lambda_names:
                 client = self.manager.session_factory(region=region).client('lambda')
-                names = [function['FunctionName'] for function in client.list_functions()['Functions']]
+                paginator = client.get_paginator('list_functions')
+                names = []
+                for page in paginator.paginate():
+                    for function in page['Functions']:
+                        names.append(function['FunctionName'])
                 regional_lambda_names[region] = names
             return regional_lambda_names[region]
         this_region = fetch_region_names(self.manager.config.region)
