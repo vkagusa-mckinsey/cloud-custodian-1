@@ -54,6 +54,7 @@ from c7n.exceptions import PolicyValidationError
 from c7n.filters import (
     FilterRegistry, Filter, CrossAccountAccessFilter, MetricsFilter,
     ValueFilter)
+from c7n.filters.core import glob_match
 from c7n.manager import resources
 from c7n.output import NullBlobOutput
 from c7n import query
@@ -832,6 +833,9 @@ class HasStatementFilter(BucketFilterBase):
                         {'type': 'object'}, {'type': 'array'}]},
                     'NotPrincipal': {
                         'anyOf': [{'type': 'object'}, {'type': 'array'}]},
+                    # Used to wildcard + array match list of permissions, expecting one of them.
+                    # c7n: used to differentiate vs the raw check
+                    'c7n:ActionMatches': {'type': 'string'},
                     'Action': {
                         'anyOf': [{'type': 'string'}, {'type': 'array'}]},
                     'NotAction': {
@@ -867,7 +871,15 @@ class HasStatementFilter(BucketFilterBase):
             for statement in statements:
                 found = 0
                 for key, value in required_statement.items():
-                    if key in statement and value == statement[key]:
+                    if key == 'c7n:ActionMatches':
+                        actions = statement['Action']
+                        if not isinstance(actions, list):
+                            actions = [actions]
+                        for action in actions:
+                          if glob_match(value, action):
+                            found += 1
+                            break
+                    elif key in statement and value == statement[key]:
                         found += 1
                 if found and found == len(required_statement):
                     required_statements.remove(required_statement)
