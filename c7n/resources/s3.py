@@ -54,6 +54,7 @@ from c7n.exceptions import PolicyValidationError
 from c7n.filters import (
     FilterRegistry, Filter, CrossAccountAccessFilter, MetricsFilter,
     ValueFilter)
+from c7n.filters.core import glob_match
 from c7n.manager import resources
 from c7n.output import NullBlobOutput
 from c7n import query
@@ -832,6 +833,9 @@ class HasStatementFilter(BucketFilterBase):
                         {'type': 'object'}, {'type': 'array'}]},
                     'NotPrincipal': {
                         'anyOf': [{'type': 'object'}, {'type': 'array'}]},
+                    # Used to wildcard + array match list of permissions, expecting one of them.
+                    # c7n: used to differentiate vs the raw check
+                    'c7n:ActionMatches': {'type': 'string'},
                     'Action': {
                         'anyOf': [{'type': 'string'}, {'type': 'array'}]},
                     'NotAction': {
@@ -867,7 +871,15 @@ class HasStatementFilter(BucketFilterBase):
             for statement in statements:
                 found = 0
                 for key, value in required_statement.items():
-                    if key in statement and value == statement[key]:
+                    if key == 'c7n:ActionMatches':
+                        actions = statement['Action']
+                        if not isinstance(actions, list):
+                            actions = [actions]
+                        for action in actions:
+                          if glob_match(value, action):
+                            found += 1
+                            break
+                    elif key in statement and value == statement[key]:
                         found += 1
                 if found and found == len(required_statement):
                     required_statements.remove(required_statement)
@@ -973,6 +985,39 @@ class MissingPolicyStatementFilter(Filter):
         if not required:
             return False
         return True
+
+@filters.register('policy-value')
+class PolicyValue(ValueFilter):
+    """Find buckets who match a given value for their policy
+
+    :example:
+
+        .. code-block: yaml
+
+            policies:
+              - name: s3-bucket-with-cloudtrail
+                resource: s3
+                filters:
+                  - type: policy-value
+                    key:
+                    value:
+    """
+
+    schema = type_schema('policy-value', rinherit=ValueFilter.schema)
+    permissions = ('s3:GetBucketPolicy',)
+
+    def process(self, resources, event=None):
+        matches = []
+        for item in resources:
+            policy = item.get('Policy', None)
+            if policy is None:
+                continue
+            if 'c7n:ParsedPolicy' not in item:
+                parsedPolicy = json.loads(policy)
+                item['c7n:ParsedPolicy'] = parsedPolicy
+            if self.match(item['c7n:ParsedPolicy']):
+                matches.append(item)
+        return matches
 
 
 @filters.register('bucket-notification')
@@ -1402,7 +1447,7 @@ class FilterPublicBlock(Filter):
         IgnorePublicAcls={'type': 'boolean'},
         BlockPublicPolicy={'type': 'boolean'},
         RestrictPublicBuckets={'type': 'boolean'})
-    permissions = ("s3:GetBucketPublicAccessBlock",)
+    permissions = ("s3:GetBucketPublicAccessBlock", "s3control:GetPublicAccessBlock")
     keys = (
         'BlockPublicPolicy', 'BlockPublicAcls', 'IgnorePublicAcls', 'RestrictPublicBuckets')
     annotation_key = 'c7n:PublicAccessBlock'
@@ -1416,6 +1461,24 @@ class FilterPublicBlock(Filter):
                     results.append(futures[f])
         return results
 
+    def account_level_configuration(self):
+        configuration = self.manager._cache.get('account-public-access-block-configuration')
+        if configuration:
+            return configuration
+
+        configuration = {}
+        session = local_session(self.manager.session_factory)
+        s3control = session.client('s3control')
+
+        try:
+            configuration = s3control.get_public_access_block(AccountId=self.manager.config.account_id)['PublicAccessBlockConfiguration']
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'NoSuchPublicAccessBlockConfiguration':
+                raise
+
+        self.manager._cache.save('account-public-access-block-configuration', configuration)
+        return configuration
+
     def process_bucket(self, bucket):
         s3 = bucket_client(local_session(self.manager.session_factory), bucket)
         config = dict(bucket.get(self.annotation_key, {key: False for key in self.keys}))
@@ -1426,7 +1489,15 @@ class FilterPublicBlock(Filter):
             except ClientError as e:
                 if e.response['Error']['Code'] != 'NoSuchPublicAccessBlockConfiguration':
                     raise
+
+            account_config = self.account_level_configuration()
+            for (k, v)  in account_config.items():
+                if v:
+                    config[k] = True
+
             bucket[self.annotation_key] = config
+
+
         return self.matches_filter(config)
 
     def matches_filter(self, config):
@@ -2600,7 +2671,10 @@ class RemoveBucketTag(RemoveTag):
 @filters.register('data-events')
 class DataEvents(Filter):
 
-    schema = type_schema('data-events', state={'enum': ['present', 'absent']})
+    schema = type_schema(
+      'data-events',
+      state={'enum': ['present', 'absent']},
+      event_type={'enum': ['WriteOnly', 'ReadOnly', 'All']})
     permissions = (
         'cloudtrail:DescribeTrails',
         'cloudtrail:GetEventSelectors')
@@ -2617,15 +2691,29 @@ class DataEvents(Filter):
 
         event_buckets = {}
         for t in trails:
-            for events in clients[t.get('HomeRegion')].get_event_selectors(
-                    TrailName=t['Name']).get('EventSelectors', ()):
+          try:
+            event_response = clients[t.get('HomeRegion')].get_event_selectors(
+                    TrailName=t['Name'])
+            event_selectors = event_response.get('EventSelectors', ())
+            event_type = self.data['event_type']
+            for events in event_selectors:
                 if 'DataResources' not in events:
                     continue
+                read_write_type = events['ReadWriteType']
+                matches_read = event_type == 'ReadOnly' and read_write_type != 'WriteOnly'
+                matches_write = event_type == 'WriteOnly' and read_write_type != 'ReadOnly'
                 for data_events in events['DataResources']:
                     if data_events['Type'] != 'AWS::S3::Object':
                         continue
                     for b in data_events['Values']:
-                        event_buckets[b.rsplit(':')[-1].strip('/')] = t['Name']
+                        if read_write_type == 'All' or matches_read or matches_write:
+                          bucket_name = b.rsplit(':')[-1].strip('/')
+                          if bucket_name == 's3':
+                            bucket_name = 'all'
+                          event_buckets[bucket_name] = t['Name']
+          except ClientError as e:
+            if e.response['Error']['Code'] != 'TrailNotFoundException':
+                raise
         return event_buckets
 
     def process(self, resources, event=None):
@@ -2634,9 +2722,9 @@ class DataEvents(Filter):
         event_buckets = self.get_event_buckets(session, trails)
         ops = {
             'present': lambda x: (
-                x['Name'] in event_buckets or '' in event_buckets),
+                x['Name'] in event_buckets or 'all' in event_buckets),
             'absent': (
-                lambda x: x['Name'] not in event_buckets and ''
+                lambda x: x['Name'] not in event_buckets and 'all'
                 not in event_buckets)}
 
         op = ops[self.data['state']]

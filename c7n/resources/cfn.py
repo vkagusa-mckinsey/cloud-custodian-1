@@ -1,6 +1,7 @@
 # Copyright The Cloud Custodian Authors.
 # SPDX-License-Identifier: Apache-2.0
 import logging
+import json
 
 from botocore.exceptions import ClientError
 from concurrent.futures import as_completed
@@ -10,6 +11,7 @@ from c7n.manager import resources
 from c7n.query import QueryResourceManager, TypeInfo
 from c7n.utils import local_session, type_schema
 from c7n.tags import RemoveTag, Tag
+from c7n.filters.iam import RoleActionEffectFilter
 
 log = logging.getLogger('custodian.cfn')
 
@@ -26,6 +28,22 @@ class CloudFormation(QueryResourceManager):
         name = 'StackName'
         date = 'CreationTime'
         cfn_type = config_type = 'AWS::CloudFormation::Stack'
+
+    def augment(self, stacks):
+        client = local_session(self.session_factory).client('cloudformation')
+        model = self.get_model()
+
+        def _augment(stack):
+            stack_id = stack['StackId']
+            full_stack = self.retry(client.describe_stacks, StackName=stack_id)['Stacks'][0]
+            stack_policy = self.retry(client.get_stack_policy, StackName=stack_id).get('StackPolicyBody', None)
+
+            full_stack['StackPolicyBody'] = stack_policy
+            if stack_policy:
+                full_stack['StackPolicy'] = json.loads(stack_policy)
+            return full_stack
+
+        return [_augment(stack) for stack in stacks]
 
 
 @CloudFormation.action_registry.register('delete')
@@ -195,7 +213,6 @@ def _tag_stack(client, s, add=(), remove=()):
         Tags=[{'Key': k, 'Value': v} for k, v in tags.items()],
     )
 
-
 @CloudFormation.action_registry.register('remove-tag')
 class CloudFormationRemoveTag(RemoveTag):
     """Action to remove tags from a cloudformation stack
@@ -217,3 +234,7 @@ class CloudFormationRemoveTag(RemoveTag):
     def process_resource_set(self, client, stacks, keys):
         for s in stacks:
             _tag_stack(client, s, remove=keys)
+
+@CloudFormation.filter_registry.register('role-action-effect')
+class RoleActionEffectFilter(RoleActionEffectFilter):
+    role_arn_selector = "RoleARN"

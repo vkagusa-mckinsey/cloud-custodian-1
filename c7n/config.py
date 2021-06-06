@@ -43,6 +43,7 @@ class Config(Bag):
             'output_dir': '',
             'cache_period': 0,
             'dryrun': False,
-            'authorization_file': None})
+            'authorization_file': None,
+            'credential_helper': None})
         d.update(kw)
         return cls(d)

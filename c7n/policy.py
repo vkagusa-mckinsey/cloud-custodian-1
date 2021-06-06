@@ -9,6 +9,7 @@ import os
 import time
 
 from dateutil import parser, tz as tzutil
+import beeline
 import jmespath
 
 from c7n.cwe import CloudWatchEvents
@@ -26,12 +27,13 @@ from c7n.version import version
 log = logging.getLogger('c7n.policy')
 
 
+@beeline.traced(name='policy.load')
 def load(options, path, format=None, validate=True, vars=None):
     # should we do os.path.expanduser here?
     if not os.path.exists(path):
         raise IOError("Invalid path for config %r" % path)
 
-    from c7n.schema import validate, StructureParser
+    from c7n.schema import StructureParser, validate as validate_schema
     data = utils.load_file(path, format=format, vars=vars)
 
     structure = StructureParser()
@@ -44,7 +46,7 @@ def load(options, path, format=None, validate=True, vars=None):
         return None
 
     if validate:
-        errors = validate(data, resource_types=rtypes)
+        errors = validate_schema(data, resource_types=rtypes)
         if errors:
             raise PolicyValidationError(
                 "Failed to validate policy %s \n %s" % (
@@ -269,6 +271,7 @@ class PullMode(PolicyExecutionMode):
 
     schema = utils.type_schema('pull')
 
+    @beeline.traced(name='PullMode.run')
     def run(self, *args, **kw):
         if not self.policy.is_runnable():
             return []
