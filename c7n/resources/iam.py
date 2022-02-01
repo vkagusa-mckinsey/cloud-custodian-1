@@ -19,7 +19,7 @@ from dateutil.parser import parse as parse_date
 
 from botocore.exceptions import ClientError
 
-
+from c7n import deprecated
 from c7n.actions import BaseAction
 from c7n.exceptions import PolicyValidationError
 from c7n.filters import ValueFilter, Filter
@@ -29,7 +29,7 @@ from c7n.filters.iam import ActionEffectFilter
 from c7n.manager import resources
 from c7n.query import ConfigSource, QueryResourceManager, DescribeSource, TypeInfo
 from c7n.resolver import ValuesFrom
-from c7n.tags import TagActionFilter, TagDelayedAction, Tag, RemoveTag
+from c7n.tags import TagActionFilter, TagDelayedAction, Tag, RemoveTag, universal_augment
 from c7n.utils import (
     get_partition, local_session, type_schema, chunks, filter_empty, QueryParser,
     select_keys
@@ -391,6 +391,9 @@ class DescribePolicy(DescribeSource):
                     continue
         return results
 
+    def augment(self, resources):
+        return universal_augment(self.manager, super().augment(resources))
+
 
 @resources.register('iam-policy')
 class Policy(QueryResourceManager):
@@ -398,7 +401,7 @@ class Policy(QueryResourceManager):
     class resource_type(TypeInfo):
         service = 'iam'
         arn_type = 'policy'
-        enum_spec = ('list_policies', 'Policies', None)
+        enum_spec = ('list_policies', 'Policies', {'Scope': 'Local'})
         id = 'PolicyId'
         name = 'PolicyName'
         date = 'CreateDate'
@@ -406,6 +409,7 @@ class Policy(QueryResourceManager):
         # Denotes this resource type exists across regions
         global_resource = True
         arn = 'Arn'
+        universal_taggable = object()
 
     source_mapping = {
         'describe': DescribePolicy,
@@ -630,12 +634,27 @@ class CheckPermissions(Filter):
 
         policies:
           - name: super-users
-            resource: iam-user
+            resource: aws.iam-user
             filters:
               - type: check-permissions
                 match: allowed
                 actions:
                  - iam:CreateUser
+
+    :example:
+
+    Find users with access to all services and actions
+
+    .. code-block:: yaml
+
+        policies:
+          - name: admin-users
+            resource: aws.iam-user
+            filters:
+              - type: check-permissions
+                match: allowed
+                actions:
+                  - '*:*'
 
     By default permission boundaries are checked.
     """
@@ -654,6 +673,21 @@ class CheckPermissions(Filter):
     policy_annotation = 'c7n:policy'
     eval_annotation = 'c7n:perm-matches'
 
+    def validate(self):
+        # This filter relies on IAM policy simulator APIs. From the docs concerning action names:
+        #
+        # "Each operation must include the service identifier, such as iam:CreateUser. This
+        # operation does not support using wildcards (*) in an action name."
+        #
+        # We can catch invalid actions during policy validation, rather than waiting to hit
+        # runtime exceptions.
+        for action in self.data['actions']:
+            if ':' not in action[1:-1]:
+                raise PolicyValidationError(
+                    "invalid check-permissions action: '%s' must be in the form <service>:<action>"
+                    % (action,))
+        return self
+
     def get_permissions(self):
         if self.manager.type == 'iam-policy':
             return ('iam:SimulateCustomPolicy', 'iam:GetPolicyVersion')
@@ -668,9 +702,19 @@ class CheckPermissions(Filter):
         actions = self.data['actions']
         matcher = self.get_eval_matcher()
         operator = self.data.get('match-operator', 'and') == 'and' and all or any
-
         arn_resources = list(zip(self.get_iam_arns(resources), resources))
-        self.initialize_boundaries(client, arn_resources)
+
+        # To ignore permission boundaries, override with an allow-all policy
+        self.simulation_boundary_override = '''
+            {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "*",
+                    "Resource": "*"
+                }]
+            }
+        ''' if not self.data.get('boundaries', True) else None
         results = []
         eval_cache = {}
         for arn, r in arn_resources:
@@ -693,49 +737,6 @@ class CheckPermissions(Filter):
                 results.append(r)
         return results
 
-    def initialize_boundaries(self, client, iam_resources):
-        """For IAM boundaries we need to retrieve boundary policy content.
-        """
-        # boundaries aren't attached to these.
-        if (self.manager.type in ('iam-policy', 'iam-group') or
-                self.data.get('boundary', True) is False):
-            return
-
-        # if boundary attributes aren't directly on the resource, fetch
-        # the iam role for the resource to get the boundary.
-        if self.manager.type not in ('iam-role', 'iam-user'):
-            iam_arns = {iam_arn for iam_arn, r in iam_resources if iam_arn is not None}
-            roles = self.manager.get_resource_manager(
-                'iam-role').get_resources(list(iam_arns), augment=False)
-            boundary_iam_map = {
-                r['Arn']: r.get('PermissionsBoundary', {}).get('PermissionsBoundaryArn')
-                for r in roles}
-            boundary_map = {}
-            for iam_arn, r in iam_resources:
-                boundary_map[self.manager.get_arns((r,))[0]] = boundary_iam_map.get(iam_arn)
-        else:
-            boundary_map = {
-                resource_arn: r.get('PermissionsBoundary', {}).get('PermissionsBoundaryArn')
-                for resource_arn, r in iam_resources}
-
-        # fetch boundary policies text
-        boundary_arns = set(boundary_map.values())
-        if None in boundary_arns:
-            boundary_arns.remove(None)
-        policies = self.manager.get_resource_manager(
-            'iam-policy').get_resources(list(boundary_arns))
-        boundaries = {}
-        for p in policies:
-            boundaries[p['Arn']] = json.dumps(client.get_policy_version(
-                PolicyArn=p['Arn'],
-                VersionId=p['DefaultVersionId'])['PolicyVersion']['Document'])
-
-        for resource_arn, boundary_arn in list(boundary_map.items()):
-            if boundary_arn is None:
-                continue
-            boundary_map[resource_arn] = boundaries[boundary_arn]
-        self.boundaries = boundary_map
-
     def get_iam_arns(self, resources):
         return self.manager.get_arns(resources)
 
@@ -752,15 +753,24 @@ class CheckPermissions(Filter):
                 ActionNames=actions).get('EvaluationResults', ())
             return evaluations
 
-        params = dict(PolicySourceArn=arn, ActionNames=actions)
-        if self.boundaries:
-            boundary_policy = self.boundaries.get(
-                self.manager.get_arns([r])[0])
-            if boundary_policy:
-                params['PermissionsBoundaryPolicyInputList'] = [boundary_policy]
+        params = dict(
+            PolicySourceArn=arn,
+            ActionNames=actions,
+            ignore_err_codes=('NoSuchEntity',))
 
-        evaluations = self.manager.retry(
-            client.simulate_principal_policy, **params).get('EvaluationResults', ())
+        # simulate_principal_policy() respects permission boundaries by default. To opt out of
+        # considering boundaries for this filter, we can provide an allow-all policy
+        # as the boundary.
+        #
+        # Note: Attempting to use an empty list for the boundary seems like a reasonable
+        # impulse too, but that seems to cause the simulator to fall back to its default
+        # of using existing boundaries.
+        if self.simulation_boundary_override:
+            params['PermissionsBoundaryPolicyInputList'] = [self.simulation_boundary_override]
+
+        evaluations = (self.manager.retry(
+            client.simulate_principal_policy,
+            **params) or {}).get('EvaluationResults', ())
         return evaluations
 
     def get_eval_matcher(self):
@@ -910,6 +920,9 @@ class UnusedIamRole(IamRoleUsage):
               - type: used
                 state: false
     """
+    deprecations = (
+        deprecated.filter("use the 'used' filter with 'state' attribute"),
+    )
 
     schema = type_schema('unused')
 
@@ -1412,7 +1425,7 @@ class UnusedInstanceProfiles(IamRoleUsage):
         results = []
         profiles = self.instance_profile_usage()
         for r in resources:
-            if (r['Arn'] not in profiles or r['InstanceProfileName'] not in profiles):
+            if (r['Arn'] not in profiles and r['InstanceProfileName'] not in profiles):
                 results.append(r)
         self.log.info(
             "%d of %d instance profiles currently not in use." % (

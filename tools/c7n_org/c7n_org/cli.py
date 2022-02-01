@@ -10,6 +10,7 @@ import os
 import time
 import subprocess  # nosec
 import sys
+from datetime import timedelta, datetime
 
 import multiprocessing
 from concurrent.futures import (
@@ -27,7 +28,7 @@ from c7n.executor import MainThreadExecutor
 from c7n.config import Config
 from c7n.policy import PolicyCollection
 from c7n.provider import get_resource_class
-from c7n.reports.csvout import Formatter, fs_record_set
+from c7n.reports.csvout import Formatter, fs_record_set, record_set, strip_output_path
 from c7n.resources import load_available
 from c7n.utils import CONN_CACHE, dumps, filter_empty
 
@@ -312,7 +313,20 @@ def report_account(account, region, policies_config, output_path, cache_path, de
         log.debug(
             "Report policy:%s account:%s region:%s path:%s",
             p.name, account['name'], region, output_path)
-        policy_records = fs_record_set(p.ctx.log_dir, p.name)
+
+        if p.ctx.output.type == "s3":
+            delta = timedelta(days=1)
+            begin_date = datetime.now() - delta
+
+            policy_records = record_set(
+                p.session_factory,
+                p.ctx.output.config['netloc'],
+                strip_output_path(p.ctx.output.config['path'], p.name),
+                begin_date
+            )
+        else:
+            policy_records = fs_record_set(p.ctx.log_dir, p.name)
+
         for r in policy_records:
             r['policy'] = p.name
             r['region'] = p.options.region
@@ -410,15 +424,18 @@ def report(config, output, use, output_dir, accounts,
     writer.writerows(rows)
 
 
-def _get_env_creds(account, session, region):
-    env = {}
+def _get_env_creds(account, session, region, env=None):
+    env = env or {}
     if account["provider"] == 'aws':
         creds = session._session.get_credentials()
         env['AWS_ACCESS_KEY_ID'] = creds.access_key
         env['AWS_SECRET_ACCESS_KEY'] = creds.secret_key
         env['AWS_SESSION_TOKEN'] = creds.token
         env['AWS_DEFAULT_REGION'] = region
+        env['AWS_REGION'] = region
         env['AWS_ACCOUNT_ID'] = account["account_id"]
+        # we're explicitly setting credential and region configuratio
+        env.pop('AWS_PROFILE', None)
     elif account["provider"] == 'azure':
         env['AZURE_SUBSCRIPTION_ID'] = account["account_id"]
     elif account["provider"] == 'gcp':
@@ -434,9 +451,7 @@ def run_account_script(account, region, output_dir, debug, script_args):
     except ClientError:
         return 1
 
-    env = os.environ.copy()
-    env.update(_get_env_creds(account, session, region))
-
+    env = _get_env_creds(account, session, region, dict(os.environ))
     log.info("running script on account:%s region:%s script: `%s`",
              account['name'], region, " ".join(script_args))
 

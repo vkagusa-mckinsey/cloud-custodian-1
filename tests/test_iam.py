@@ -87,7 +87,7 @@ class UserCredentialReportTest(BaseTest):
                 {"type": "credential",
                  "report_max_age": 1543724277,
                  "key": "access_keys.last_rotated",
-                 "value": 700,
+                 "value": 900,
                  "op": "greater-than",
                  'value_type': 'age'}],
             'actions': [
@@ -117,11 +117,13 @@ class UserCredentialReportTest(BaseTest):
             'filters': [
                 {'UserName': 'test1'},
                 {"type": "credential",
+                 "report_max_age": 1543724277,
                  "key": "access_keys.last_rotated",
                  "value": 30,
                  'op': 'gt',
                  "value_type": "age"},
                 {"type": "credential",
+                 "report_max_age": 1543724277,
                  "key": "access_keys.active",
                  "value": True,
                  "op": "eq"}],
@@ -137,26 +139,52 @@ class UserCredentialReportTest(BaseTest):
         self.assertEqual(len(keys), 2)
 
     def test_credential_access_key_reverse_filter_delete(self):
+        access_key_filters = [
+            {"type": "credential",
+             "report_max_age": 1585865564,
+             "key": "access_keys.last_used_date",
+             "value": 90,
+             'op': 'gte',
+             "value_type": "age"},
+            {"type": "credential",
+             "report_max_age": 1585865564,
+             "key": "access_keys.last_rotated",
+             "value": 90,
+             "op": "gte",
+             'value_type': 'age'}]
+
+        # Given:
+        # - Two access key filters
+        # - A single user with two access keys
+        # - Each access key matching one filter but not the other
+        #
+        # Nesting the access key filters inside an 'or' block
+        # should yield 2 matched keys, while the default 'and'
+        # behavior should match 1.
+
         factory = self.replay_flight_data(
             'test_iam_user_credential_reverse_filter_delete'
         )
         p = self.load_policy({
-            'name': 'user-cred-multi-reverse',
+            'name': 'user-cred-multi-reverse-or',
             'resource': 'iam-user',
             'filters': [
                 {'UserName': 'zscholl'},
-                {"type": "credential",
-                 "report_max_age": 1585865564,
-                 "key": "access_keys.last_used_date",
-                 "value": 90,
-                 'op': 'gte',
-                 "value_type": "age"},
-                {"type": "credential",
-                 "report_max_age": 1585865564,
-                 "key": "access_keys.last_rotated",
-                 "value": 90,
-                 "op": "gte",
-                 'value_type': 'age'}],
+                {'or': access_key_filters}]},
+            session_factory=factory)
+        resources = p.run()
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(len(resources[0]['c7n:matched-keys']), 2)
+
+        factory = self.replay_flight_data(
+            'test_iam_user_credential_reverse_filter_delete'
+        )
+        p = self.load_policy({
+            'name': 'user-cred-multi-reverse-and',
+            'resource': 'iam-user',
+            'filters': [
+                {'UserName': 'zscholl'},
+                *access_key_filters],
             'actions': [
                 {'type': 'remove-keys',
                  'disable': True,
@@ -508,6 +536,12 @@ class IamRoleTest(BaseTest):
             p.resource_manager.get_arns(resources),
             ['arn:aws:iam::644160558196:role/service-role/AmazonSageMaker-ExecutionRole-20180108T122369']) # NOQA
 
+        self.assertDeprecation(p, """
+            policy 'iam-inuse-role'
+              filters:
+                unused: filter has been deprecated (use the 'used' filter with 'state' attribute)
+            """)
+
     def test_iam_role_get_resources(self):
         session_factory = self.replay_flight_data("test_iam_role_get_resource")
         p = self.load_policy(
@@ -702,6 +736,24 @@ class IamUserTest(BaseTest):
         resources = p.push({'detail': {
             'eventName': '', 'eventSource': '', 'ids': ['kapil']}}, None)
         self.assertEqual(len(resources), 1)
+
+    def test_iam_user_check_permissions_validation(self):
+        invalid_actions = ['', '*', ':', 'iam', 's3:', ':GetObject']
+        valid_actions = ['*:*', 's3:GetObject', 'iam:GetUser']
+
+        def _policy_with_action(action):
+            return {
+                "name": "check-permissions-test-policy",
+                "resource": "aws.iam-user",
+                'filters': [{'type': 'check-permissions', 'match': 'allowed', 'actions': [action]}],
+            }
+
+        for action in invalid_actions:
+            self.assertRaises(PolicyValidationError, self.load_policy, _policy_with_action(action))
+
+        for action in valid_actions:
+            p = self.load_policy(_policy_with_action(action))
+            p.validate()
 
     def test_iam_user_check_permissions(self):
         factory = self.replay_flight_data('test_iam_user_check_permissions')
@@ -1005,7 +1057,9 @@ class IamInstanceProfileFilterUsage(BaseTest):
             session_factory=session_factory,
         )
         resources = p.run()
-        self.assertEqual(len(resources), 2)
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]["Arn"], "arn:aws:iam::644160558196:instance-profile/mandeep")
+        self.assertEqual(resources[0]["InstanceProfileName"], "mandeep")
 
 
 class IamPolicyFilterUsage(BaseTest):
@@ -1054,7 +1108,7 @@ class IamPolicyFilterUsage(BaseTest):
             session_factory=session_factory,
         )
         resources = p.run()
-        self.assertEqual(len(resources), 7)
+        self.assertEqual(len(resources), 6)
 
     def test_iam_unattached_policies(self):
         session_factory = self.replay_flight_data("test_iam_policy_unattached")
@@ -1068,7 +1122,7 @@ class IamPolicyFilterUsage(BaseTest):
             session_factory=session_factory,
         )
         resources = p.run()
-        self.assertEqual(len(resources), 202)
+        self.assertEqual(len(resources), 1)
 
 
 class IamPolicy(BaseTest):
@@ -1121,7 +1175,7 @@ class IamPolicy(BaseTest):
                     {
                         "type": "value",
                         "key": "PolicyName",
-                        "value": "AdministratorAccess",
+                        "value": "MyAdminPolicy",
                     },
                     "has-allow-all",
                 ],

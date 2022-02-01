@@ -9,6 +9,7 @@ import json
 import hashlib
 import logging
 
+from c7n import deprecated
 from c7n.actions import Action
 from c7n.filters import Filter
 from c7n.exceptions import PolicyValidationError, PolicyExecutionError
@@ -50,9 +51,11 @@ class SecurityHubFindingFilter(Filter):
                 'securityhub', region_name=self.data.get('region'))
         found = []
         params = dict(self.data.get('query', {}))
-
         for r_arn, resource in zip(self.manager.get_arns(resources), resources):
             params['ResourceId'] = [{"Value": r_arn, "Comparison": "EQUALS"}]
+            if resource.get("InstanceId"):
+                params['ResourceId'].append(
+                    {"Value": resource["InstanceId"], "Comparison": "EQUALS"})
             findings = client.get_findings(Filters=params).get("Findings")
             if len(findings) > 0:
                 resource[self.annotation_key] = findings
@@ -128,9 +131,12 @@ class SecurityHub(LambdaMode):
                 # Security hub invented some new arn format for a few resources...
                 # detect that and normalize to something sane.
                 if r['Id'].startswith('AWS') and r['Type'] == 'AwsIamAccessKey':
+                    if 'PrincipalName' in r['Details']['AwsIamAccessKey']:
+                        label = r['Details']['AwsIamAccessKey']['PrincipalName']
+                    else:
+                        label = r['Details']['AwsIamAccessKey']['UserName']
                     rids.add('arn:aws:iam::%s:user/%s' % (
-                        f['AwsAccountId'],
-                        r['Details']['AwsIamAccessKey']['UserName']))
+                        f['AwsAccountId'], label))
                 elif not r['Id'].startswith('arn'):
                     log.warning("security hub unknown id:%s rtype:%s",
                                 r['Id'], r['Type'])
@@ -294,7 +300,7 @@ class PostFinding(Action):
            - type: post-finding
              description: |
                 Shield should be enabled on account to allow for DDOS protection (1 time 3k USD Charge).
-             severity_normalized: 6
+             severity_label: LOW
              types:
                - "Software and Configuration Checks/Industry and Regulatory Standards/NIST CSF Controls (USA)"
              recommendation: "Enable shield"
@@ -303,6 +309,10 @@ class PostFinding(Action):
              compliance_status: FAILED
 
     """ # NOQA
+
+    deprecations = (
+        deprecated.field('severity_normalized', 'severity_label'),
+    )
 
     FindingVersion = "2018-10-08"
 
@@ -330,7 +340,7 @@ class PostFinding(Action):
         recommendation={"type": "string"},
         recommendation_url={"type": "string"},
         fields={"type": "object"},
-        batch_size={'type': 'integer', 'minimum': 1, 'maximum': 10, 'default': 1},
+        batch_size={'type': 'integer', 'minimum': 1, 'maximum': 100, 'default': 1},
         types={
             "type": "array",
             "minItems": 1,
@@ -393,43 +403,46 @@ class PostFinding(Action):
         # which only shows a single resource in a finding.
         batch_size = self.data.get('batch_size', 1)
         stats = Counter()
-        for key, grouped_resources in self.group_resources(resources).items():
-            for resource_set in chunks(grouped_resources, batch_size):
-                stats['Finding'] += 1
-                if key == self.NEW_FINDING:
-                    finding_id = None
-                    created_at = now
-                    updated_at = now
-                else:
-                    finding_id, created_at = self.get_finding_tag(
-                        resource_set[0]).split(':', 1)
-                    updated_at = now
+        for resource_set in chunks(resources, batch_size):
+            findings = []
+            for key, grouped_resources in self.group_resources(resource_set).items():
+                for resource in grouped_resources:
+                    stats['Finding'] += 1
+                    if key == self.NEW_FINDING:
+                        finding_id = None
+                        created_at = now
+                        updated_at = now
+                    else:
+                        finding_id, created_at = self.get_finding_tag(
+                            resource).split(':', 1)
+                        updated_at = now
 
-                finding = self.get_finding(
-                    resource_set, finding_id, created_at, updated_at)
-                import_response = client.batch_import_findings(
-                    Findings=[finding])
-                if import_response['FailedCount'] > 0:
-                    stats['Failed'] += import_response['FailedCount']
-                    self.log.error(
-                        "import_response=%s" % (import_response))
-                if key == self.NEW_FINDING:
-                    stats['New'] += len(resource_set)
-                    # Tag resources with new finding ids
-                    tag_action = self.manager.action_registry.get('tag')
-                    if tag_action is None:
-                        continue
-                    tag_action({
-                        'key': '{}:{}'.format(
-                            'c7n:FindingId',
-                            self.data.get(
-                                'title', self.manager.ctx.policy.name)),
-                        'value': '{}:{}'.format(
-                            finding['Id'], created_at)},
-                        self.manager).process(resource_set)
-                else:
-                    stats['Update'] += len(resource_set)
-
+                    finding = self.get_finding(
+                        [resource], finding_id, created_at, updated_at)
+                    findings.append(finding)
+                    if key == self.NEW_FINDING:
+                        stats['New'] += 1
+                        # Tag resources with new finding ids
+                        tag_action = self.manager.action_registry.get('tag')
+                        if tag_action is None:
+                            continue
+                        tag_action({
+                            'key': '{}:{}'.format(
+                                'c7n:FindingId',
+                                self.data.get(
+                                    'title', self.manager.ctx.policy.name)),
+                            'value': '{}:{}'.format(
+                                finding['Id'], created_at)},
+                            self.manager).process([resource])
+                    else:
+                        stats['Update'] += 1
+            import_response = self.manager.retry(
+                client.batch_import_findings, Findings=findings
+            )
+            if import_response['FailedCount'] > 0:
+                stats['Failed'] += import_response['FailedCount']
+                self.log.error(
+                    "import_response=%s" % (import_response))
         self.log.debug(
             "policy:%s securityhub %d findings resources %d new %d updated %d failed",
             self.manager.ctx.policy.name,
