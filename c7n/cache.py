@@ -65,10 +65,12 @@ class InMemoryCache:
         return True
 
     def get(self, key):
-        return self.data.get(pickle.dumps(key))  # nosemgrep
+        data =  self.data.get(pickle.dumps(key))  # nosemgrep
+        if data:
+            return pickle.loads(data)
 
     def save(self, key, data):
-        self.data[pickle.dumps(key)] = data  # nosemgrep
+        self.data[pickle.dumps(key)] = pickle.dumps(data)  # nosemgrep
 
     def size(self):
         return sum(map(len, self.data.values()))
