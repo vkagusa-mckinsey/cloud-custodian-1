@@ -3,7 +3,11 @@
 """Provide basic caching services to avoid extraneous queries over
 multiple policies on the same resource type.
 """
-import pickle  # nosec nosemgrep
+
+try:
+   import cPickle as pickle
+except:
+   import pickle
 
 import os
 import logging
