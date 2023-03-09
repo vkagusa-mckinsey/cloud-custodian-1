@@ -14,28 +14,10 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from c7n.manager import resources
-from c7n.query import QueryResourceManager, ChildResourceManager, sources, ChildDescribeSource, TypeInfo
+from c7n.query import ChildResourceManager, sources, ChildDescribeSource, TypeInfo
 from c7n.utils import local_session, chunks
 from itertools import chain
 
-@resources.register('guardduty-detector')
-class Detector(QueryResourceManager):
-
-    class resource_type(TypeInfo):
-        service = 'guardduty'
-        enum_spec = ('list_detectors', 'DetectorIds', None)
-        detail_spec = ("get_detector", 'DetectorId', None, None)
-        id = 'DetectorId'
-        name = None
-        date = None
-        dimension = None
-        arn = False
-        config_type = "AWS::GuardDuty::Detector"
-        filter_name = None
-
-    @classmethod
-    def has_arn(self):
-        return False
 
 @sources.register('get-guardduty-findings')
 class GetGuardDutyFindings(ChildDescribeSource):
@@ -54,7 +36,8 @@ class GetGuardDutyFindings(ChildDescribeSource):
             grouped[parent_id].append(resource)
         manager = self.manager
         for (parent_id, subset) in grouped.items():
-            client = local_session(manager.session_factory).client('guardduty', region_name=manager.config.region)
+            client = local_session(
+                manager.session_factory).client('guardduty', region_name=manager.config.region)
 
             for batch in chunks(subset, 50):
                 response = client.get_findings(
@@ -66,12 +49,14 @@ class GetGuardDutyFindings(ChildDescribeSource):
 
         return list(chain.from_iterable(output))
 
+
 @resources.register('guardduty-finding')
 class Finding(ChildResourceManager):
 
-    child_source= 'get-guardduty-findings'
+    child_source = 'get-guardduty-findings'
 
     class resource_type(TypeInfo):
+
         service = 'guardduty'
         parent_spec = ('guardduty-detector', 'DetectorId', None)
         enum_spec = ('list_findings', 'FindingIds', None)
