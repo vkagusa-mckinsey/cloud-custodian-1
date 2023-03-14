@@ -14,9 +14,30 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from c7n.manager import resources
-from c7n.query import ChildResourceManager, sources, ChildDescribeSource, TypeInfo
+from c7n.query import QueryResourceManager, ChildResourceManager
+from c7n.query import sources, ChildDescribeSource, TypeInfo
 from c7n.utils import local_session, chunks
 from itertools import chain
+
+
+@resources.register('guardduty-detector')
+class Detector(QueryResourceManager):
+
+    class resource_type(TypeInfo):
+        service = 'guardduty'
+        enum_spec = ('list_detectors', 'DetectorIds', None)
+        detail_spec = ("get_detector", 'DetectorId', None, None)
+        id = 'DetectorId'
+        name = None
+        date = None
+        dimension = None
+        arn = False
+        config_type = "AWS::GuardDuty::Detector"
+        filter_name = None
+
+    @classmethod
+    def has_arn(self):
+        return False
 
 
 @sources.register('get-guardduty-findings')
