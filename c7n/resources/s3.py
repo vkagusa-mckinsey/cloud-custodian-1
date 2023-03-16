@@ -55,6 +55,7 @@ from c7n.filters import (
     FilterRegistry, Filter, CrossAccountAccessFilter, MetricsFilter,
     ValueFilter)
 from c7n.filters.core import glob_match
+import c7n.filters.policystatement as polstmt_filter
 from c7n.manager import resources
 from c7n.output import NullBlobOutput
 from c7n import query
@@ -111,6 +112,8 @@ class ConfigS3(query.ConfigSource):
         resource.pop('Owner', None)
 
         for k, null_value in S3_CONFIG_SUPPLEMENT_NULL_MAP.items():
+            if k not in cfg:
+                continue
             if cfg.get(k) == null_value:
                 continue
             method = getattr(self, "handle_%s" % k, None)
@@ -812,104 +815,15 @@ class BucketFinding(PostFinding):
         return filter_empty(resource)
 
 
-@filters.register('has-statement')
-class HasStatementFilter(BucketFilterBase):
-    """Find buckets with set of policy statements.
-
-    :example:
-
-    .. code-block:: yaml
-
-            policies:
-              - name: s3-bucket-has-statement
-                resource: s3
-                filters:
-                  - type: has-statement
-                    statement_ids:
-                      - RequiredEncryptedPutObject
-
-
-            policies:
-              - name: s3-public-policy
-                resource: s3
-                filters:
-                  - type: has-statement
-                    statements:
-                      - Effect: Allow
-                        Action: 's3:*'
-                        Principal: '*'
-    """
-    schema = type_schema(
-        'has-statement',
-        statement_ids={'type': 'array', 'items': {'type': 'string'}},
-        statements={
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'Sid': {'type': 'string'},
-                    'Effect': {'type': 'string', 'enum': ['Allow', 'Deny']},
-                    'Principal': {'anyOf': [
-                        {'type': 'string'},
-                        {'type': 'object'}, {'type': 'array'}]},
-                    'NotPrincipal': {
-                        'anyOf': [{'type': 'object'}, {'type': 'array'}]},
-                    # Used to wildcard + array match list of permissions, expecting one of them.
-                    # c7n: used to differentiate vs the raw check
-                    'c7n:ActionMatches': {'type': 'string'},
-                    'Action': {
-                        'anyOf': [{'type': 'string'}, {'type': 'array'}]},
-                    'NotAction': {
-                        'anyOf': [{'type': 'string'}, {'type': 'array'}]},
-                    'Resource': {
-                        'anyOf': [{'type': 'string'}, {'type': 'array'}]},
-                    'NotResource': {
-                        'anyOf': [{'type': 'string'}, {'type': 'array'}]},
-                    'Condition': {'type': 'object'}
-                },
-                'required': ['Effect']
-            }
-        })
-
-    def process(self, buckets, event=None):
-        return list(filter(None, map(self.process_bucket, buckets)))
-
-    def process_bucket(self, b):
-        p = b.get('Policy')
-        if p is None:
-            return None
-        p = json.loads(p)
-
-        required = list(self.data.get('statement_ids', []))
-        statements = p.get('Statement', [])
-        for s in list(statements):
-            if s.get('Sid') in required:
-                required.remove(s['Sid'])
-
-        required_statements = format_string_values(list(self.data.get('statements', [])),
-                                                   **self.get_std_format_args(b))
-        for required_statement in required_statements:
-            for statement in statements:
-                found = 0
-                for key, value in required_statement.items():
-                    if key == 'c7n:ActionMatches':
-                        actions = statement['Action']
-                        if not isinstance(actions, list):
-                            actions = [actions]
-                        for action in actions:
-                          if glob_match(value, action):
-                            found += 1
-                            break
-                    elif key in statement and value == statement[key]:
-                        found += 1
-                if found and found == len(required_statement):
-                    required_statements.remove(required_statement)
-                    break
-
-        if (self.data.get('statement_ids', []) and not required) or \
-           (self.data.get('statements', []) and not required_statements):
-            return b
-        return None
+@S3.filter_registry.register('has-statement')
+class HasStatementFilter(polstmt_filter.HasStatementFilter):
+    def get_std_format_args(self, bucket):
+        return {
+            'account_id': self.manager.config.account_id,
+            'region': self.manager.config.region,
+            'bucket_name': bucket['Name'],
+            'bucket_region': get_region(bucket)
+        }
 
 
 ENCRYPTION_STATEMENT_GLOB = {
@@ -2819,7 +2733,7 @@ class SetInventory(BucketActionBase):
             'Size', 'LastModifiedDate', 'StorageClass', 'ETag',
             'IsMultipartUploaded', 'ReplicationStatus', 'EncryptionStatus',
             'ObjectLockRetainUntilDate', 'ObjectLockMode', 'ObjectLockLegalHoldStatus',
-            'IntelligentTieringAccessTier']}})
+            'IntelligentTieringAccessTier', 'BucketKeyStatus', 'ChecksumAlgorithm']}})
 
     permissions = ('s3:PutInventoryConfiguration', 's3:GetInventoryConfiguration')
 
