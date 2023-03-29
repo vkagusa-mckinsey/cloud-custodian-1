@@ -1,0 +1,43 @@
+{
+    "status_code": 200, 
+    "data": {
+        "Stacks": [
+            {
+                "StackId": "arn:aws:cloudformation:us-east-1:644160558196:stack/sphere11-dev/514b9370-c6b0-11e6-a4cc-50d5cd26c2d2", 
+                "Description": "Automatically generated with Zappa", 
+                "Tags": [
+                    {
+                        "Value": "sphere11-dev", 
+                        "Key": "ZappaProject"
+                    }
+                ], 
+                "CreationTime": {
+                    "hour": 12, 
+                    "__class__": "datetime", 
+                    "month": 12, 
+                    "second": 6, 
+                    "microsecond": 615000, 
+                    "year": 2016, 
+                    "day": 20, 
+                    "minute": 32
+                }, 
+                "StackName": "sphere11-dev", 
+                "NotificationARNs": [], 
+                "StackStatus": "CREATE_COMPLETE", 
+                "DisableRollback": false
+            }
+        ], 
+        "ResponseMetadata": {
+            "RetryAttempts": 0, 
+            "HTTPStatusCode": 200, 
+            "RequestId": "7dbedc5c-c6b1-11e6-b3e7-9d7da24f9689", 
+            "HTTPHeaders": {
+                "x-amzn-requestid": "7dbedc5c-c6b1-11e6-b3e7-9d7da24f9689", 
+                "vary": "Accept-Encoding", 
+                "content-length": "3796", 
+                "content-type": "text/xml", 
+                "date": "Tue, 20 Dec 2016 12:40:30 GMT"
+            }
+        }
+    }
+}

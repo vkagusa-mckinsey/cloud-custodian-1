@@ -1,0 +1,15 @@
+{
+    "status_code": 200,
+    "data": {
+        "StackPolicyBody": {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "Update:*",
+                    "Principal": "*",
+                    "Resource": "*"
+                }
+            ]
+        }
+    }
+}
