@@ -11,6 +11,8 @@ import logging
 import os
 import sys
 import beeline
+from typing import List
+
 import yaml
 from yaml.constructor import ConstructorError
 
@@ -291,8 +293,7 @@ AWS_ERROR_BLACKLIST = ['OptInRequired', 'SubscriptionRequiredException', 'Endpoi
 AWS_EXPIRED_REQUESTS = ['RequestExpired', 'ExpiredToken', 'ExpiredTokenException', 'InvalidClientTokenId', 'AuthFailure']
 
 @policy_command
-@traceable(name='c7n-run')
-def run(options, policies):
+def run(options, policies: List[Policy]) -> None:
     exit_code = 0
 
     # AWS - Sanity check that we have an assumable role before executing policies
@@ -304,7 +305,7 @@ def run(options, policies):
             log.exception("Unable to assume role %s", options.assume_role)
             sys.exit(1)
 
-    errored_policies = []
+    errored_policies: List[str] = []
     for policy in policies:
         def invoke_policy(attempt=0, retry_limit=3):
             with beeline.tracer(name="outer-policy"):

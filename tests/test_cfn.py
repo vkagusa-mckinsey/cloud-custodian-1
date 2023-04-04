@@ -7,6 +7,23 @@ import json
 
 
 class TestCFN(BaseTest):
+    def test_cfn_stack_policy(self):
+        factory = self.replay_flight_data("test_cfn_stack_policy")
+        p = self.load_policy(
+            {
+                "name": "cfn-delete",
+                "resource": "cfn",
+                "filters": [{"type": "stack-policy", "key": "StackPolicyBody", "value": "present"}],
+            },
+            session_factory=factory,
+        )
+        resources = p.run()
+        self.maxDiff = None
+        self.assertEqual(
+            sorted([r["StackName"] for r in resources]),
+            ["sphere11-dev"]
+        )
+
     def test_delete(self):
         factory = self.replay_flight_data("test_cfn_delete")
         p = self.load_policy(

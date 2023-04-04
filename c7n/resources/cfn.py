@@ -7,11 +7,11 @@ from botocore.exceptions import ClientError
 from concurrent.futures import as_completed
 
 from c7n.actions import BaseAction
+from c7n.filters import ValueFilter
 from c7n.manager import resources
 from c7n.query import QueryResourceManager, TypeInfo
 from c7n.utils import local_session, type_schema
 from c7n.tags import RemoveTag, Tag
-from c7n.filters.iam import RoleActionEffectFilter
 
 log = logging.getLogger('custodian.cfn')
 
@@ -29,21 +29,47 @@ class CloudFormation(QueryResourceManager):
         date = 'CreationTime'
         cfn_type = config_type = 'AWS::CloudFormation::Stack'
 
-    def augment(self, stacks):
-        client = local_session(self.session_factory).client('cloudformation')
-        model = self.get_model()
 
-        def _augment(stack):
-            stack_id = stack['StackId']
-            full_stack = self.retry(client.describe_stacks, StackName=stack_id)['Stacks'][0]
-            stack_policy = self.retry(client.get_stack_policy, StackName=stack_id).get('StackPolicyBody', None)
+@CloudFormation.filter_registry.register('stack-policy')
+class CloudFormationStackPolicyFilter(ValueFilter):
+    """Check for stack policy on a cloudformation stack.
 
-            full_stack['StackPolicyBody'] = stack_policy
-            if stack_policy:
-                full_stack['StackPolicy'] = json.loads(stack_policy)
-            return full_stack
+    :example:
 
-        return [_augment(stack) for stack in stacks]
+    .. code-block:: yaml
+
+            policies:
+              - name: cfn-stack-policy-present
+                resource: aws.cfn
+                filters:
+                  - type: stack-policy
+                    key: StackPolicyBody
+                    value: absent
+    """
+    annotation_key = 'c7n:stack-policy'
+    annotate = False
+    schema = type_schema('stack-policy', rinherit=ValueFilter.schema)
+    schema_alias = False
+    permissions = ('cloudformation:GetStackPolicy',)
+
+    def process(self, resources, event=None):
+        self.augment([r for r in resources if self.annotation_key not in r])
+        return super().process(resources, event)
+
+    def augment(self, resources):
+        client = local_session(self.manager.session_factory).client('cloudformation')
+        for r in resources:
+            try:
+                stack_policy = client.get_stack_policy(
+                    StackName=r['StackName']).get('StackPolicyBody', None)
+
+                r[self.annotation_key] = {'StackPolicyBody': stack_policy}
+
+            except client.exceptions.StackNotFoundException:
+                continue
+
+    def __call__(self, r):
+        return super().__call__(r[self.annotation_key])
 
 
 @CloudFormation.action_registry.register('delete')
@@ -235,6 +261,3 @@ class CloudFormationRemoveTag(RemoveTag):
         for s in stacks:
             _tag_stack(client, s, remove=keys)
 
-@CloudFormation.filter_registry.register('role-action-effect')
-class RoleActionEffectFilter(RoleActionEffectFilter):
-    role_arn_selector = "RoleARN"

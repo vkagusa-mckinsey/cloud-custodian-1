@@ -28,12 +28,9 @@ class Detector(QueryResourceManager):
         enum_spec = ('list_detectors', 'DetectorIds', None)
         detail_spec = ("get_detector", 'DetectorId', None, None)
         id = 'DetectorId'
-        name = None
-        date = None
-        dimension = None
-        arn = False
+        name = "detector"
         config_type = "AWS::GuardDuty::Detector"
-        filter_name = None
+        permissions_enum = ('guardduty:GetDetector','guardduty:ListDetectors')
 
     @classmethod
     def has_arn(self):
@@ -82,9 +79,6 @@ class Finding(ChildResourceManager):
         parent_spec = ('guardduty-detector', 'DetectorId', None)
         enum_spec = ('list_findings', 'FindingIds', None)
         id = 'Id'
-        name = None
-        date = None
-        dimension = None
+        name = "finding"
         config_type = "AWS::GuardDuty::Finding"
-        filter_name = None
-        arn = False
+        permissions_enum = ('guardduty:GetFindings','guardduty:ListFindings')
