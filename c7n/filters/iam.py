@@ -24,7 +24,6 @@ import time
 import jmespath
 
 from c7n.filters import ValueFilter, Filter, OPERATORS
-from c7n.filters.iampermissionsmanager import IamPermissionsManager
 from c7n.utils import local_session, type_schema, chunks
 
 
@@ -67,7 +66,6 @@ class ActionEffectFilter(Filter):
 
     def process(self, resources, event=None):
         client = local_session(self.manager.session_factory).client('iam')
-        manager = IamPermissionsManager(client)
         # Filter where they match the given conditions.
         return list(filter(lambda r: self.match(r, manager), resources))
 
