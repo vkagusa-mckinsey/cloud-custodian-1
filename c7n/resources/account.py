@@ -261,7 +261,7 @@ class CloudTrailEnabled(Filter):
 
     permissions = ('cloudtrail:DescribeTrails', 'cloudtrail:GetTrailStatus',
                    'cloudtrail:GetEventSelectors', 'cloudwatch:DescribeAlarmsForMetric',
-                   'logs:DescribeMetricFilters', 'sns:ListSubscriptions')
+                   'logs:DescribeMetricFilters', 'sns:ListSubscriptionsByTopic')
 
     def process(self, resources, event=None):
         account = resources[0]
@@ -316,7 +316,7 @@ class CloudTrailEnabled(Filter):
         if self.data.get('log-metric-filter-pattern'):
             client_logs = session.client('logs')
             client_cw = session.client('cloudwatch')
-            sns_manager = self.manager.get_resource_manager('sns-subscription')
+            client_sns = session.client('sns')
             matched = []
             for t in list(trails):
                 if 'CloudWatchLogsLogGroupArn' not in t.keys():
@@ -347,10 +347,15 @@ class CloudTrailEnabled(Filter):
                 if not alarm_actions:
                     continue
                 alarm_actions = set(alarm_actions)
-                sns_subscriptions = sns_manager.resources()
-                for s in sns_subscriptions:
-                    if s['TopicArn'] in alarm_actions:
-                        matched.append(t)
+                for a in alarm_actions:
+                    try:
+                        subs = client_sns.list_subscriptions_by_topic(TopicArn=a)
+                        if len(subs['Subscriptions']) > 0:
+                            matched.append(t)
+                    except client_sns.exceptions.InvalidParameterValueException:
+                        # we can ignore any exception here, the alarm action might
+                        # not be an sns topic for instance
+                        continue
             trails = matched
         if trails:
             return []

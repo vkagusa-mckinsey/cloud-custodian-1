@@ -1,0 +1,59 @@
+{
+  "policy": {
+    "name": "label-pod",
+    "resource": "k8s.pod",
+    "description": "warning goes here",
+    "mode": {
+      "type": "k8s-admission",
+      "on-match": "warn",
+      "operations": [
+        "CREATE"
+      ]
+    },
+    "actions": [
+      {
+        "type": "event-label",
+        "labels": {
+          "foo": "bar",
+          "role": "different role",
+          "test": null
+        }
+      }
+    ]
+  },
+  "version": "0.9.24",
+  "execution": {
+    "id": "9b8ddf93-1dee-4708-bf80-568b844ac685",
+    "start": 1680667512.511416,
+    "end_time": 1680667512.5149472,
+    "duration": 0.003531217575073242
+  },
+  "config": {
+    "region": "us-east-1",
+    "regions": [],
+    "cache": "",
+    "profile": null,
+    "account_id": null,
+    "assume_role": null,
+    "external_id": null,
+    "log_group": null,
+    "tracer": "default",
+    "metrics_enabled": false,
+    "metrics": null,
+    "output_dir": "",
+    "cache_period": 0,
+    "dryrun": false,
+    "authorization_file": null,
+    "credential_helper": null
+  },
+  "sys-stats": {
+    "snapshot_time": 0.0034890174865722656,
+    "num_fds": 1,
+    "cpu_user": 0.0019169279999999844,
+    "cpu_system": 0.0015575039999990992,
+    "rss": 1343488,
+    "pfaults": 126
+  },
+  "api-stats": {},
+  "metrics": []
+}

@@ -1,0 +1,36 @@
+interactions:
+- request:
+    body: null
+    headers:
+      Connection:
+      - close
+      Host:
+      - s3.amazonaws.com
+      User-Agent:
+      - Python-urllib/3.10
+    method: HEAD
+    uri: https://s3.amazonaws.com/awsapichanges.info
+  response:
+    body:
+      string: ''
+    headers:
+      Connection:
+      - close
+      Content-Type:
+      - application/xml
+      Date:
+      - Wed, 05 Apr 2023 04:04:25 GMT
+      Server:
+      - AmazonS3
+      x-amz-access-point-alias:
+      - 'false'
+      x-amz-bucket-region:
+      - us-east-1
+      x-amz-id-2:
+      - nuwQQ+kzOyBZ6Vm6KQFCc9VOl2GVQCXkQONrCWbF38WJ+OFOv+p/h9r2k+XAaz6dVye6XUef69A=
+      x-amz-request-id:
+      - YCFDTYTMZDPK675W
+    status:
+      code: 200
+      message: OK
+version: 1
